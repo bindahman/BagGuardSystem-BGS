@@ -36,13 +36,20 @@ def main():
             counts[label] += 1
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
+
+            # Different thickness for people vs bags (readability)
+            is_person = (cls_id == 0)
+            thickness = 3 if is_person else 2
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), thickness)
+
+            text = f"{label} {conf:.2f}"
             cv2.putText(
                 frame,
-                f"{label} {conf:.2f}",
-                (x1, max(20, y1 - 10)),
+                text,
+                (x1, max(25, y1 - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.65,
                 (255, 0, 255),
                 2
             )
