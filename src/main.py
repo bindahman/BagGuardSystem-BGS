@@ -1,17 +1,39 @@
 from ultralytics import YOLO
 import cv2
 from collections import Counter
+import argparse
+import os
 
 # COCO class IDs for YOLOv8 pretrained models
 # 0 = person, 24 = backpack, 26 = handbag, 28 = suitcase
 TARGET_CLASS_IDS = {0, 24, 26, 28}
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="BagGuard System - Phase A Detection")
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="0",
+        help="Video source: 0 for webcam OR path to a video file (e.g. data/airport_demo.mp4)"
+    )
+    return parser.parse_args()
+
+def open_capture(source: str):
+    # If source is "0", "1", etc. treat as webcam index
+    if source.isdigit():
+        return cv2.VideoCapture(int(source))
+    # Otherwise treat as a video file path
+    return cv2.VideoCapture(source)
+
 def main():
+    args = parse_args()
     model = YOLO("yolov8n.pt")
 
-    cap = cv2.VideoCapture(0)  # webcam for now
+    cap = open_capture(args.source)
+
     if not cap.isOpened():
-        print("Error: Cannot open camera")
+        print(f"Error: Cannot open source: {args.source}")
+        print("Tip: use --source 0 for webcam or provide a valid video path.")
         return
 
     while True:
@@ -37,9 +59,7 @@ def main():
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-            # Thicker box for people
             thickness = 3 if cls_id == 0 else 2
-
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), thickness)
 
             cv2.putText(
@@ -70,7 +90,8 @@ def main():
 
         cv2.imshow("BagGuard System – Phase A Detection", frame)
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
             break
 
     cap.release()
