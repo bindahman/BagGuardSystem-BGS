@@ -167,6 +167,7 @@ def main():
         writer = cv2.VideoWriter(args.out, fourcc, fps, (w, h))
 
     # Fix 1: make bags "stickier" (bigger match dist + longer missed TTL)
+    # Phase B2: Separate trackers for people and bags
     person_tracker = SimpleTracker(match_dist_px=200, max_missed_sec=3.0, use_area_penalty=False)
     bag_tracker    = SimpleTracker(match_dist_px=220, max_missed_sec=5.0, use_area_penalty=True)  # Fix 3 enabled for bags
 
