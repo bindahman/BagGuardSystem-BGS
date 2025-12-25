@@ -12,6 +12,15 @@ TARGET_CLASS_IDS = {0, 24, 26, 28}
 BAG_CLASS_IDS = {24, 26, 28}
 
 # -----------------------------
+# Phase B4: Visual styling
+# -----------------------------
+COLOR_PERSON = (255, 200, 0)    # cyan-ish (BGR)
+COLOR_BAG    = (255, 0, 255)    # magenta (BGR)
+COLOR_TEXT   = (255, 255, 255)  # white
+COLOR_BG     = (0, 0, 0)        # black
+COLOR_COUNT  = (0, 255, 0)      # green
+
+# -----------------------------
 # Helpers
 # -----------------------------
 def now_sec() -> float:
@@ -34,12 +43,9 @@ def area(bbox) -> float:
 # Simple Tracker (Centroid + TTL)
 # Upgrades included:
 #  - confidence sorting (Fix 2)
-#  - optional bbox-area penalty (Fix 3) 
+#  - optional bbox-area penalty (Fix 3)
 # -----------------------------
-
-class SimpleTracker: # Phase B3: Maintains track IDs across frames, Removes stale IDs after max_missed_sec and Reduces ID flicker during short occlusions
-
-    
+class SimpleTracker:
     def __init__(self, match_dist_px=200, max_missed_sec=3.0, use_area_penalty=False):
         self.match_dist_px = float(match_dist_px)
         self.max_missed_sec = float(max_missed_sec)
@@ -90,7 +96,6 @@ class SimpleTracker: # Phase B3: Maintains track IDs across frames, Removes stal
                 d = dist(det_c, tr["centroid"])
 
                 # If centroid is too far, skip quickly
-                # (we still use d threshold even with area penalty)
                 if d > self.match_dist_px:
                     continue
 
@@ -133,10 +138,72 @@ class SimpleTracker: # Phase B3: Maintains track IDs across frames, Removes stal
         return assigned
 
 # -----------------------------
+# Drawing helpers (Phase B4)
+# -----------------------------
+def draw_label_with_bg(frame, x, y, text, box_color=COLOR_BG, text_color=COLOR_TEXT):
+    """
+    Draws text with a solid background box.
+    x, y is baseline-ish position; we'll build a box above it.
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.6
+    thickness = 2
+    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+
+    # box coords (ensure not negative)
+    x1 = max(0, x)
+    y2 = max(0, y)
+    y1 = max(0, y2 - th - 10)
+    x2 = x1 + tw + 8
+
+    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, -1)
+    cv2.putText(frame, text, (x1 + 4, y2 - 4), font, scale, text_color, thickness)
+
+def draw_assigned(frame, assigned, color, person=False):
+    for tid, det in assigned:
+        x1, y1, x2, y2 = det["bbox"]
+        conf = det["conf"]
+        label = det["label"]
+
+        thickness = 3 if person else 2
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+
+        text = f"{label} #{tid} {conf:.2f}"
+        draw_label_with_bg(frame, x1, max(25, y1), text, box_color=COLOR_BG, text_color=COLOR_TEXT)
+
+def draw_counts_panel(frame, counts: Counter):
+    # HUD-style count panel (top-left)
+    panel_x, panel_y = 8, 8
+    panel_w, panel_h = 260, 130
+
+    cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), COLOR_BG, -1)
+    cv2.putText(
+        frame, "Counts",
+        (panel_x + 10, panel_y + 24),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+        COLOR_TEXT, 2
+    )
+
+    y = panel_y + 55
+    for name in ["person", "backpack", "handbag", "suitcase"]:
+        cv2.putText(
+            frame,
+            f"{name}: {counts.get(name, 0)}",
+            (panel_x + 10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            COLOR_COUNT,
+            2
+        )
+        y += 26
+
+# -----------------------------
 # Main
 # -----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="BagGuard System - Phase A Detection + Simple Tracking (less flicker)")
+    parser = argparse.ArgumentParser(
+        description="BagGuard System - Phase A Detection + Phase B Tracking (IDs, reduced flicker, better visuals)"
+    )
     parser.add_argument("--source", default="0", help="0 for webcam OR path to video file")
     parser.add_argument("--model", default="yolov8n.pt", help="YOLOv8 model path/name")
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
@@ -158,7 +225,9 @@ def main():
     # Video writer (optional)
     writer = None
     if args.save:
-        os.makedirs(os.path.dirname(args.out), exist_ok=True)
+        out_dir = os.path.dirname(args.out)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         if fps is None or fps <= 1e-3:
@@ -169,12 +238,11 @@ def main():
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(args.out, fourcc, fps, (w, h))
 
-    # Fix 1: make bags "stickier" (bigger match dist + longer missed TTL)
-    # Phase B2: Separate trackers for people and bags
+    # Make bags "stickier" (bigger match dist + longer missed TTL + area penalty)
     person_tracker = SimpleTracker(match_dist_px=200, max_missed_sec=3.0, use_area_penalty=False)
-    bag_tracker    = SimpleTracker(match_dist_px=220, max_missed_sec=5.0, use_area_penalty=True)  # Fix 3 enabled for bags
+    bag_tracker    = SimpleTracker(match_dist_px=220, max_missed_sec=5.0, use_area_penalty=True)
 
-    window_title = "BagGuard System – Phase A Detection + Tracking"
+    window_title = "BagGuard System – Phase A Detection + Phase B Tracking"
 
     while True:
         ret, frame = cap.read()
@@ -222,42 +290,12 @@ def main():
         assigned_people = person_tracker.update(det_person, t)
         assigned_bags   = bag_tracker.update(det_bags, t)
 
-        # Draw tracked boxes + IDs
-        def draw_assigned(assigned, color=(255, 0, 255), person=False):
-            for tid, det in assigned:
-                x1, y1, x2, y2 = det["bbox"]
-                conf = det["conf"]
-                label = det["label"]
+        # Draw tracked boxes + IDs (Phase B4)
+        draw_assigned(frame, assigned_people, COLOR_PERSON, person=True)
+        draw_assigned(frame, assigned_bags, COLOR_BAG, person=False)
 
-                thickness = 3 if person else 2
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-
-                text = f"{label} #{tid} {conf:.2f}"
-                cv2.putText(
-                    frame, text,
-                    (x1, max(25, y1 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    color,
-                    2
-                )
-
-        draw_assigned(assigned_people, person=True)
-        draw_assigned(assigned_bags, person=False)
-
-        # Show counts on top-left
-        y = 28
-        for name in ["person", "backpack", "handbag", "suitcase"]:
-            cv2.putText(
-                frame,
-                f"{name}: {counts.get(name, 0)}",
-                (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                (0, 255, 0),
-                2
-            )
-            y += 26
+        # Counts panel (Phase B4)
+        draw_counts_panel(frame, counts)
 
         # Save frame (optional)
         if writer is not None:
