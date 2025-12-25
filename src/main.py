@@ -34,9 +34,12 @@ def area(bbox) -> float:
 # Simple Tracker (Centroid + TTL)
 # Upgrades included:
 #  - confidence sorting (Fix 2)
-#  - optional bbox-area penalty (Fix 3)
+#  - optional bbox-area penalty (Fix 3) 
 # -----------------------------
-class SimpleTracker:
+
+class SimpleTracker: # Phase B3: Maintains track IDs across frames, Removes stale IDs after max_missed_sec and Reduces ID flicker during short occlusions
+
+    
     def __init__(self, match_dist_px=200, max_missed_sec=3.0, use_area_penalty=False):
         self.match_dist_px = float(match_dist_px)
         self.max_missed_sec = float(max_missed_sec)
