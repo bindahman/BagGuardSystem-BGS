@@ -13,3 +13,6 @@ venv/
 
 *.log
 *.tmp
+
+Daohan_test_video/outputs
+Daohan_test_image/outputs

@@ -1,4 +1,4 @@
-*.mp4
+Daohan_test_image/outputs/
+Daohan_test_video/outputs/
 
-# Ignore output videos
-Daohan_test_image/
+Daohan_test_video/airport_demo_clip1.mp4

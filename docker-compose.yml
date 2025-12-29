@@ -6,3 +6,5 @@ services:
     container_name: bgs-app
     build: .
     tty: true
+    volumes:
+      - ./:/app

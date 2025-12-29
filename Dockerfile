@@ -1,20 +1,28 @@
 FROM python:3.10-slim
 
-# 2. optimize Python environment
+# optimize Python environment
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# 3. Then set working directory in the container
+# set working directory
 WORKDIR /app
 
-# 4. copy dependency file
+# ✅ OpenCV runtime deps (fix: ImportError: libGL.so.1)
+# libgl1 provides libGL.so.1
+# libglib2.0-0 is a common OpenCV runtime dependency
+RUN apt-get update && apt-get install -y \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# copy dependency file
 COPY requirements.txt .
 
-# 5. install dependencies
+# install python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 6. copy project files
+# copy project files
 COPY . .
 
-# 7. start the application
-CMD ["python", "helloworld.py"]
+# start the application
+CMD ["python", "Daohan_test_image/test.py", "Daohan_test_video/0.py"]
