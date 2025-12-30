@@ -21,23 +21,59 @@ COLOR_BG     = (0, 0, 0)        # black
 COLOR_COUNT  = (0, 255, 0)      # green
 
 # -----------------------------
-# Helpers
+# Phase C2: Nearest-person association (per frame)
+# -----------------------------
+MAX_ASSOC_DIST_PX = 180  # if nearest person farther than this, bag is UNASSIGNED
+
+# -----------------------------
+# Helpers (time, geometry, distance)
 # -----------------------------
 def now_sec() -> float:
     return time.time()
 
-def dist(p1, p2) -> float:
-    dx = p1[0] - p2[0]
-    dy = p1[1] - p2[1]
-    return (dx * dx + dy * dy) ** 0.5
-
-def centroid(bbox):
+def bbox_centroid(bbox):
     x1, y1, x2, y2 = bbox
     return ((x1 + x2) // 2, (y1 + y2) // 2)
 
-def area(bbox) -> float:
+def bbox_area(bbox) -> float:
     x1, y1, x2, y2 = bbox
     return max(1.0, float((x2 - x1) * (y2 - y1)))
+
+def euclid(p1, p2) -> float:
+    dx = float(p1[0] - p2[0])
+    dy = float(p1[1] - p2[1])
+    return (dx * dx + dy * dy) ** 0.5
+
+def frame_diag(frame):
+    h, w = frame.shape[:2]
+    return (w * w + h * h) ** 0.5
+
+def normalized_distance(p1, p2, frame):
+    """0.0–1.0-ish scale (distance divided by frame diagonal)."""
+    d = euclid(p1, p2)
+    diag = max(1.0, frame_diag(frame))
+    return d / diag
+
+def nearest_person_for_bag(bag_centroid, assigned_people, max_dist_px):
+    """
+    assigned_people: list of (person_id, det_dict)
+    returns: (best_person_id or None, best_dist_px or None)
+    """
+    best_pid = None
+    best_d = float("inf")
+
+    for pid, pdet in assigned_people:
+        d = euclid(bag_centroid, pdet["centroid"])
+        if d < best_d:
+            best_d = d
+            best_pid = pid
+
+    if best_pid is None:
+        return None, None
+
+    if best_d > max_dist_px:
+        return None, best_d  # too far -> treat as unassigned, but keep distance info
+    return best_pid, best_d
 
 # -----------------------------
 # Simple Tracker (Centroid + TTL)
@@ -52,7 +88,7 @@ class SimpleTracker:
         self.use_area_penalty = bool(use_area_penalty)
 
         self.next_id = 1
-        self.tracks = {}  # id -> dict
+        self.tracks = {}  # id -> dict {centroid, bbox, area, last_seen}
 
     def _cleanup_stale(self, now_t):
         stale = []
@@ -76,7 +112,7 @@ class SimpleTracker:
         """
         self._cleanup_stale(now_t)
 
-        # Fix 2: sort by confidence (high -> low) to reduce ID swaps
+        # Sort by confidence (high -> low) to reduce ID swaps
         detections = sorted(detections, key=lambda d: d["conf"], reverse=True)
 
         used_track_ids = set()
@@ -87,20 +123,19 @@ class SimpleTracker:
             best_score = float("inf")
 
             det_c = det["centroid"]
-            det_a = area(det["bbox"])
+            det_a = bbox_area(det["bbox"])
 
             for tid, tr in self.tracks.items():
                 if tid in used_track_ids:
                     continue
 
-                d = dist(det_c, tr["centroid"])
+                d = euclid(det_c, tr["centroid"])
 
-                # If centroid is too far, skip quickly
+                # too far -> skip
                 if d > self.match_dist_px:
                     continue
 
                 if self.use_area_penalty:
-                    # Fix 3: penalize mismatch in bbox area (helps with bags swapping)
                     tr_a = tr.get("area", det_a)
                     ratio = det_a / max(tr_a, 1e-6)
                     ratio = max(ratio, 1.0 / max(ratio, 1e-6))  # make >= 1
@@ -138,19 +173,14 @@ class SimpleTracker:
         return assigned
 
 # -----------------------------
-# Drawing helpers (Phase B4)
+# Drawing helpers (Phase B4 + Phase C2 labels)
 # -----------------------------
 def draw_label_with_bg(frame, x, y, text, box_color=COLOR_BG, text_color=COLOR_TEXT):
-    """
-    Draws text with a solid background box.
-    x, y is baseline-ish position; we'll build a box above it.
-    """
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.6
     thickness = 2
     (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
 
-    # box coords (ensure not negative)
     x1 = max(0, x)
     y2 = max(0, y)
     y1 = max(0, y2 - th - 10)
@@ -159,7 +189,10 @@ def draw_label_with_bg(frame, x, y, text, box_color=COLOR_BG, text_color=COLOR_T
     cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, -1)
     cv2.putText(frame, text, (x1 + 4, y2 - 4), font, scale, text_color, thickness)
 
-def draw_assigned(frame, assigned, color, person=False):
+def draw_assigned(frame, assigned, color, person=False, bag_assoc=None):
+    """
+    bag_assoc: dict bag_id -> (owner_pid or None, dist_px or None)
+    """
     for tid, det in assigned:
         x1, y1, x2, y2 = det["bbox"]
         conf = det["conf"]
@@ -168,11 +201,19 @@ def draw_assigned(frame, assigned, color, person=False):
         thickness = 3 if person else 2
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
-        text = f"{label} #{tid} {conf:.2f}"
+        if (not person) and bag_assoc is not None:
+            owner_pid, dpx = bag_assoc.get(tid, (None, None))
+            if owner_pid is None:
+                extra = f"owner: -  d:{dpx:.0f}px" if dpx is not None else "owner: -"
+            else:
+                extra = f"owner: P{owner_pid}  d:{dpx:.0f}px"
+            text = f"{label} #{tid} {conf:.2f} | {extra}"
+        else:
+            text = f"{label} #{tid} {conf:.2f}"
+
         draw_label_with_bg(frame, x1, max(25, y1), text, box_color=COLOR_BG, text_color=COLOR_TEXT)
 
 def draw_counts_panel(frame, counts: Counter):
-    # HUD-style count panel (top-left)
     panel_x, panel_y = 8, 8
     panel_w, panel_h = 260, 130
 
@@ -202,7 +243,7 @@ def draw_counts_panel(frame, counts: Counter):
 # -----------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="BagGuard System - Phase A Detection + Phase B Tracking (IDs, reduced flicker, better visuals)"
+        description="BagGuard System - Phase A Detection + Phase B Tracking + Phase C (C1+C2)"
     )
     parser.add_argument("--source", default="0", help="0 for webcam OR path to video file")
     parser.add_argument("--model", default="yolov8n.pt", help="YOLOv8 model path/name")
@@ -214,7 +255,6 @@ def main():
 
     model = YOLO(args.model)
 
-    # Source handling
     source = 0 if str(args.source).strip() == "0" else args.source
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -222,7 +262,6 @@ def main():
         print("Tip: use --source 0 for webcam or provide a valid video path.")
         return
 
-    # Video writer (optional)
     writer = None
     if args.save:
         out_dir = os.path.dirname(args.out)
@@ -238,11 +277,10 @@ def main():
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(args.out, fourcc, fps, (w, h))
 
-    # Make bags "stickier" (bigger match dist + longer missed TTL + area penalty)
     person_tracker = SimpleTracker(match_dist_px=200, max_missed_sec=3.0, use_area_penalty=False)
     bag_tracker    = SimpleTracker(match_dist_px=220, max_missed_sec=5.0, use_area_penalty=True)
 
-    window_title = "BagGuard System – Phase A Detection + Phase B Tracking"
+    window_title = "BagGuard System – Phase A+B+C (C1+C2)"
 
     while True:
         ret, frame = cap.read()
@@ -250,10 +288,8 @@ def main():
             break
 
         t = now_sec()
-
         results = model(frame, verbose=False, conf=args.conf)[0]
 
-        # Collect detections filtered to target classes
         det_person = []
         det_bags = []
         counts = Counter()
@@ -269,7 +305,7 @@ def main():
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             bbox = (x1, y1, x2, y2)
-            c = centroid(bbox)
+            c = bbox_centroid(bbox)
 
             det = {
                 "cls_id": cls_id,
@@ -286,22 +322,22 @@ def main():
             else:
                 det_bags.append(det)
 
-        # Update trackers separately
         assigned_people = person_tracker.update(det_person, t)
         assigned_bags   = bag_tracker.update(det_bags, t)
 
-        # Draw tracked boxes + IDs (Phase B4)
-        draw_assigned(frame, assigned_people, COLOR_PERSON, person=True)
-        draw_assigned(frame, assigned_bags, COLOR_BAG, person=False)
+        # Phase C2: per-frame bag -> nearest person association
+        bag_associations = {}  # bag_id -> (person_id or None, dist_px or None)
+        for bid, bdet in assigned_bags:
+            owner_pid, dpx = nearest_person_for_bag(bdet["centroid"], assigned_people, MAX_ASSOC_DIST_PX)
+            bag_associations[bid] = (owner_pid, dpx)
 
-        # Counts panel (Phase B4)
+        draw_assigned(frame, assigned_people, COLOR_PERSON, person=True)
+        draw_assigned(frame, assigned_bags, COLOR_BAG, person=False, bag_assoc=bag_associations)
         draw_counts_panel(frame, counts)
 
-        # Save frame (optional)
         if writer is not None:
             writer.write(frame)
 
-        # Show (optional)
         if args.show:
             cv2.imshow(window_title, frame)
             key = cv2.waitKey(1) & 0xFF
