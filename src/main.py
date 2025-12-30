@@ -301,7 +301,7 @@ def main():
         if writer is not None:
             writer.write(frame)
 
-        # Show (optional)
+        # Show  (optional)
         if args.show:
             cv2.imshow(window_title, frame)
             key = cv2.waitKey(1) & 0xFF
