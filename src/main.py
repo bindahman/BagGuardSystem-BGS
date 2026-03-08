@@ -79,6 +79,8 @@ class BGSConfig:
     PERSON_CLASS_ID = 0
     BAG_CLASS_IDS = [24, 26, 28]
     DETECTION_CONFIDENCE = 0.20  # Fixed confidence threshold
+    PERSON_CONF = DETECTION_CONFIDENCE
+    BAG_CONF = DETECTION_CONFIDENCE - 0.05
     IOU_THRESHOLD = 0.45
     
     # ═══════════════════════════════════════════════════════════════════════
@@ -112,9 +114,9 @@ class BGSConfig:
     
     # Section 7.3: Assignment Rules
     ASSIGNMENT_DISTANCE = 2.5       # meters - close enough to be owner
-    CONFIRMATION_TIME = 1.0         # seconds - time to confirm ownership
-    OWNERSHIP_LOCK_TIME = 3.0       # seconds - ownership locked after assignment
-    SWITCH_DISTANCE_IMPROVEMENT = 1.0  # meters - required to switch owner
+    CONFIRMATION_TIME = 2.0         # seconds - time to confirm ownership
+    OWNERSHIP_LOCK_TIME = 10.0      # seconds - ownership locked after assignment
+    SWITCH_DISTANCE_IMPROVEMENT = 1.5  # meters - required to switch owner
     
     # ═══════════════════════════════════════════════════════════════════════
     # SECTION 8: UNATTENDED BAG LOGIC
@@ -645,7 +647,8 @@ class BagGuardSystem:
     """
     
     def __init__(self, model_path: str, video_path: str, output_path: str,
-                 imgsz: int, max_fps: float, skip: int, half: bool):
+                 imgsz: int, max_fps: float, skip: int, half: bool,
+                 tracker_profile: str = "main"):
         self.model_path = model_path
         self.video_path = video_path
         self.output_path = output_path
@@ -653,6 +656,7 @@ class BagGuardSystem:
         self.max_fps = float(max_fps)
         self.skip = max(0, int(skip))
         self.half = bool(half)
+        self.tracker_profile = str(tracker_profile).strip().lower()
         self.config = BGSConfig
         resolved_model_path = os.path.abspath(model_path)
         
@@ -693,6 +697,7 @@ class BagGuardSystem:
         self.model.to(self.device)
 
         self._validate_class_config()
+        self.tracker_path = self._resolve_tracker_path()
         self._log_device()
         self._run_startup_inference()
         
@@ -707,10 +712,36 @@ class BagGuardSystem:
         
         # Statistics
         self.frame_count = 0
+        self.inference_frame_count = 0
         self.person_ids_seen = set()
         self.bag_ids_seen = set()
         self.start_time = None
         self.previous_bags = {}
+        self.next_bag_stable_id = 1
+        self.bag_id_flip_count = 0
+        self.bag_flip_window_start = 0
+        self.bag_flip_debug_tracks = {}
+        self.next_bag_flip_debug_id = 1
+
+    def _calculate_iou(self, bbox1: List[float], bbox2: List[float]) -> float:
+        """Calculate IoU between two bounding boxes [x1, y1, x2, y2]."""
+        x1 = max(bbox1[0], bbox2[0])
+        y1 = max(bbox1[1], bbox2[1])
+        x2 = min(bbox1[2], bbox2[2])
+        y2 = min(bbox1[3], bbox2[3])
+
+        inter_w = max(0.0, x2 - x1)
+        inter_h = max(0.0, y2 - y1)
+        inter_area = inter_w * inter_h
+
+        area1 = max(0.0, bbox1[2] - bbox1[0]) * max(0.0, bbox1[3] - bbox1[1])
+        area2 = max(0.0, bbox2[2] - bbox2[0]) * max(0.0, bbox2[3] - bbox2[1])
+        union_area = area1 + area2 - inter_area
+
+        if union_area <= 0.0:
+            return 0.0
+
+        return inter_area / union_area
 
     def _validate_class_config(self):
         expected_ids = self.config.EXPECTED_CLASS_IDS
@@ -740,7 +771,112 @@ class BagGuardSystem:
 
     def _log_device(self):
         print(f"✓ Device: {self.device}")
-        print(f"✓ Runtime: imgsz={self.imgsz} max_fps={self.max_fps} skip={self.skip} half={self.half}")
+        print(
+            f"✓ Runtime: imgsz={self.imgsz} max_fps={self.max_fps} "
+            f"skip={self.skip} half={self.half} tracker_profile={self.tracker_profile}"
+        )
+
+    def _resolve_tracker_path(self) -> str:
+        tracker_value = str(self.config.TRACKER).strip()
+        root = Path(__file__).resolve().parents[1]
+
+        if tracker_value.lower() in {"bytetrack", "bytetrack.yaml"}:
+            profile_to_file = {
+                "main": root / "trackers" / "bytetrack_bgs.yaml",
+                "stable": root / "trackers" / "bytetrack_bgs_stable.yaml",
+            }
+            if self.tracker_profile not in profile_to_file:
+                print(f"❌ Invalid tracker profile: {self.tracker_profile}")
+                print("Allowed profiles: main, stable")
+                sys.exit(1)
+
+            tracker_file = profile_to_file[self.tracker_profile]
+        else:
+            tracker_path = Path(tracker_value)
+            tracker_file = tracker_path if tracker_path.is_absolute() else root / tracker_path
+
+        if not tracker_file.exists():
+            print(f"❌ Tracker config not found: {tracker_file}")
+            sys.exit(1)
+
+        try:
+            with open(tracker_file, "r", encoding="utf-8") as file_handle:
+                tracker_text = file_handle.read()
+            if "tracker_type" not in tracker_text or "bytetrack" not in tracker_text.lower():
+                print(f"❌ Invalid tracker config (expected ByteTrack): {tracker_file}")
+                sys.exit(1)
+        except Exception as e:
+            print(f"❌ Failed to load tracker config: {e}")
+            sys.exit(1)
+
+        print(f"✓ Tracker config loaded: {tracker_file}")
+        return str(tracker_file)
+
+    def _update_bag_id_flip_debug(self, boxes):
+        if boxes is None or len(boxes) == 0:
+            return
+
+        active_debug_ids = set()
+        threshold = self.config.BAG_MATCH_THRESHOLD_PX
+
+        for i in range(len(boxes)):
+            cls_id = int(boxes[i].cls[0])
+            if cls_id not in self.config.BAG_CLASS_IDS:
+                continue
+            if boxes[i].id is None:
+                continue
+
+            current_track_id = int(boxes[i].id[0])
+            bbox = boxes[i].xyxy[0].cpu().numpy().tolist()
+            center_x = (bbox[0] + bbox[2]) / 2
+            center_y = (bbox[1] + bbox[3]) / 2
+
+            best_debug_id = None
+            best_dist = float('inf')
+
+            for debug_id, data in self.bag_flip_debug_tracks.items():
+                prev_x, prev_y = data['center']
+                dist = np.sqrt((center_x - prev_x)**2 + (center_y - prev_y)**2)
+                if dist < threshold and dist < best_dist:
+                    best_dist = dist
+                    best_debug_id = debug_id
+
+            if best_debug_id is None:
+                best_debug_id = self.next_bag_flip_debug_id
+                self.next_bag_flip_debug_id += 1
+                self.bag_flip_debug_tracks[best_debug_id] = {
+                    'center': (center_x, center_y),
+                    'last_id': current_track_id,
+                    'last_seen': self.inference_frame_count
+                }
+            else:
+                data = self.bag_flip_debug_tracks[best_debug_id]
+                if data['last_id'] != current_track_id:
+                    self.bag_id_flip_count += 1
+                data['center'] = (center_x, center_y)
+                data['last_id'] = current_track_id
+                data['last_seen'] = self.inference_frame_count
+
+            active_debug_ids.add(best_debug_id)
+
+        self.bag_flip_debug_tracks = {
+            debug_id: data
+            for debug_id, data in self.bag_flip_debug_tracks.items()
+            if (self.inference_frame_count - data['last_seen'] <= self.config.BAG_FRAME_MEMORY)
+            or (debug_id in active_debug_ids)
+        }
+
+        if self.bag_flip_window_start == 0:
+            self.bag_flip_window_start = self.inference_frame_count
+
+        window_size = self.inference_frame_count - self.bag_flip_window_start
+        if window_size >= 300:
+            print(
+                f"[DEBUG][BAG_ID_FLIP_SUMMARY] frames={self.bag_flip_window_start}-{self.inference_frame_count} "
+                f"id_flips={self.bag_id_flip_count} active_spatial_tracks={len(self.bag_flip_debug_tracks)}"
+            )
+            self.bag_id_flip_count = 0
+            self.bag_flip_window_start = self.inference_frame_count
 
     def _run_startup_inference(self):
         cap = cv2.VideoCapture(self.video_path)
@@ -804,6 +940,13 @@ class BagGuardSystem:
             bbox = boxes[i].xyxy[0].cpu().numpy().tolist()
             conf = float(boxes[i].conf[0])
             class_name = self.config.TARGET_CLASSES[cls_id]
+
+            if cls_id == self.config.PERSON_CLASS_ID:
+                if conf < self.config.PERSON_CONF:
+                    continue
+            elif cls_id in self.config.BAG_CLASS_IDS:
+                if conf < self.config.BAG_CONF:
+                    continue
             
             # Get or create tracking ID
             if cls_id == 0:  # PERSON
@@ -827,9 +970,15 @@ class BagGuardSystem:
                 self.person_ids_seen.add(track_id)
                 
             else:  # BAGS
-                # Spatial tracking for bags
-                matched_id = self._match_bag_to_previous(bbox, cls_id)
-                track_id = matched_id if matched_id else cls_id * 100000 + i
+                # Prefer ByteTrack bag ID when available; fallback to spatial matching
+                if boxes[i].id is not None:
+                    track_id = 2000000 + int(boxes[i].id[0])
+                else:
+                    matched_id = self._match_bag_to_previous(bbox, cls_id)
+                    if matched_id is not None:
+                        track_id = 2000000 + matched_id
+                    else:
+                        track_id = 2000000 + (cls_id * 100000 + i)
                 
                 # Estimate 3D position
                 position_3d = self.distance_estimator.estimate_position_3d(bbox, is_person=False)
@@ -855,6 +1004,7 @@ class BagGuardSystem:
         curr_cx = (current_bbox[0] + current_bbox[2]) / 2
         curr_cy = (current_bbox[1] + current_bbox[3]) / 2
         
+        best_iou = -1.0
         min_dist = float('inf')
         matched_id = None
         threshold = self.config.BAG_MATCH_THRESHOLD_PX
@@ -862,28 +1012,32 @@ class BagGuardSystem:
         for bag_id, (prev_bbox, prev_cls, last_frame) in self.previous_bags.items():
             if prev_cls != cls_id:
                 continue
-            if self.frame_count - last_frame > self.config.BAG_FRAME_MEMORY:
+            if self.inference_frame_count - last_frame > self.config.BAG_FRAME_MEMORY:
                 continue
             
             prev_cx = (prev_bbox[0] + prev_bbox[2]) / 2
             prev_cy = (prev_bbox[1] + prev_bbox[3]) / 2
             
             dist = np.sqrt((curr_cx - prev_cx)**2 + (curr_cy - prev_cy)**2)
+            iou = self._calculate_iou(current_bbox, prev_bbox)
             
-            if dist < min_dist and dist < threshold:
-                min_dist = dist
-                matched_id = bag_id
+            if dist < threshold or iou > 0.3:
+                if iou > best_iou or (iou == best_iou and dist < min_dist):
+                    best_iou = iou
+                    min_dist = dist
+                    matched_id = bag_id
         
         if matched_id:
-            self.previous_bags[matched_id] = (current_bbox, cls_id, self.frame_count)
+            self.previous_bags[matched_id] = (current_bbox, cls_id, self.inference_frame_count)
         else:
-            new_id = cls_id * 100000 + len(self.previous_bags)
-            self.previous_bags[new_id] = (current_bbox, cls_id, self.frame_count)
+            new_id = cls_id * 100000 + self.next_bag_stable_id
+            self.next_bag_stable_id += 1
+            self.previous_bags[new_id] = (current_bbox, cls_id, self.inference_frame_count)
             matched_id = new_id
         
         # Cleanup
         self.previous_bags = {k: v for k, v in self.previous_bags.items()
-                             if self.frame_count - v[2] <= self.config.BAG_FRAME_MEMORY}
+                             if self.inference_frame_count - v[2] <= self.config.BAG_FRAME_MEMORY}
         
         return matched_id
     
@@ -895,15 +1049,41 @@ class BagGuardSystem:
         results = self.model.track(
             frame,
             persist=self.config.PERSIST,
-            conf=self.config.DETECTION_CONFIDENCE,
+            conf=min(self.config.PERSON_CONF, self.config.BAG_CONF),
             iou=self.config.IOU_THRESHOLD,
             classes=self.config.CLASS_IDS,
-            tracker=self.config.TRACKER,
+            tracker=self.tracker_path,
             imgsz=self.imgsz,
             device=self.device,
             half=self.half,
             verbose=False
         )
+
+        self._update_bag_id_flip_debug(results[0].boxes)
+
+        # Debug: print bag detections every 30 frames
+        if self.frame_count % 30 == 0:
+            boxes = results[0].boxes
+            bag_debug_count = 0
+
+            if boxes is not None and len(boxes) > 0:
+                for i in range(len(boxes)):
+                    cls_id = int(boxes[i].cls[0])
+                    if cls_id in self.config.BAG_CLASS_IDS:
+                        bag_debug_count += 1
+                        bag_class = self.config.TARGET_CLASSES.get(cls_id, f"class_{cls_id}")
+                        conf = float(boxes[i].conf[0])
+                        bbox = boxes[i].xyxy[0].cpu().numpy().tolist()
+                        print(
+                            f"[DEBUG][BAG_DET] frame={self.frame_count} "
+                            f"class={bag_class} conf={conf:.3f} bbox={bbox}"
+                        )
+
+            if bag_debug_count == 0:
+                print(
+                    f"[DEBUG][BAG_DET] frame={self.frame_count} "
+                    f"NO bag detections for classes {self.config.BAG_CLASS_IDS}"
+                )
         
         # Extract with 3D positions
         people, bags = self.extract_detections(results)
@@ -982,12 +1162,13 @@ class BagGuardSystem:
                 if not ret:
                     break
 
+                self.frame_count += 1
                 read_count += 1
                 frame = cv2.resize(frame, (self.config.IMAGE_WIDTH, self.config.IMAGE_HEIGHT))
 
                 do_infer = (self.skip == 0) or (read_count % (self.skip + 1) == 1)
                 if do_infer:
-                    self.frame_count += 1
+                    self.inference_frame_count += 1
                     current_time = time.time()
 
                     annotated_frame, stats = self.process_frame(frame)
@@ -1077,6 +1258,12 @@ def main():
     parser.add_argument("--max_fps", type=float, default=12, help="Max processing FPS (0 to disable)")
     parser.add_argument("--skip", type=int, default=0, help="Process every (skip+1)th frame")
     parser.add_argument("--half", action="store_true", help="Use FP16 if CUDA is available")
+    parser.add_argument(
+        "--tracker-profile",
+        choices=["main", "stable"],
+        default="main",
+        help="ByteTrack preset: main (default) or stable (longer persistence)",
+    )
 
     args = parser.parse_args()
 
@@ -1119,7 +1306,8 @@ def main():
         imgsz=args.imgsz,
         max_fps=args.max_fps,
         skip=args.skip,
-        half=args.half
+        half=args.half,
+        tracker_profile=args.tracker_profile,
     )
     success = system.run()
     

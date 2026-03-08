@@ -1,0 +1,8 @@
+# BGS-tuned ByteTrack configuration for improved bag ID stability
+tracker_type: bytetrack
+track_high_thresh: 0.40
+track_low_thresh: 0.10
+new_track_thresh: 0.40
+track_buffer: 120
+match_thresh: 0.90
+fuse_score: true
