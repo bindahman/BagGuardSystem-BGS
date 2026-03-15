@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import time
-from collections import deque, defaultdict
+from collections import deque
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional, Deque
 import sys
@@ -100,6 +100,7 @@ class BGSConfig:
     # ═══════════════════════════════════════════════════════════════════════
     CAMERA_HFOV = 60.0              # Horizontal field of view (degrees)
     ASSUMED_PERSON_HEIGHT = 1.70    # meters (Section 6.2)
+    ASSUMED_BAG_HEIGHT = 0.45       # meters (bag depth fallback)
     IMAGE_WIDTH = 1280              # pixels
     IMAGE_HEIGHT = 720              # pixels
     
@@ -124,6 +125,14 @@ class BGSConfig:
     # Section 8.1: Three-state status (OK, POTENTIAL, UNATTENDED)
     POTENTIAL_THRESHOLD = 5.0       # seconds - owner far, becoming potential
     UNATTENDED_THRESHOLD = 10.0     # seconds - prolonged absence = unattended
+    OWNERSHIP_RELEASE_GRACE = 5.0   # seconds - release owner after prolonged absence
+
+    # Two-layer identity persistence (registry)
+    REID_MAX_AGE_FRAMES = 900
+    REID_MATCH_MAX_AGE_FRAMES = 240
+    REID_CENTROID_THRESH = 80
+    REID_BAG_CENTROID_THRESH = 60
+    REID_IOU_THRESH = 0.25
     
     # ═══════════════════════════════════════════════════════════════════════
     # SECTION 10: VISUALIZATION
@@ -189,8 +198,9 @@ class DistanceEstimator:
         
         return depth
     
-    def estimate_position_3d(self, bbox: List[float], 
-                            is_person: bool = False) -> Tuple[float, float, float]:
+    def estimate_position_3d(self, bbox: List[float],
+                            is_person: bool = False,
+                            reference_depth: Optional[float] = None) -> Tuple[float, float, float]:
         """
         Estimate 3D position (X, Y, Z) in meters
         
@@ -212,9 +222,10 @@ class DistanceEstimator:
         if is_person and bbox_height > 50:
             # Use person height for accurate depth
             depth = self.estimate_depth(bbox_height, self.config.ASSUMED_PERSON_HEIGHT)
+        elif reference_depth is not None:
+            depth = reference_depth
         else:
-            # For bags, use average height estimate (0.5m)
-            depth = self.estimate_depth(bbox_height, 0.5)
+            depth = self.estimate_depth(bbox_height, self.config.ASSUMED_BAG_HEIGHT)
         
         # Calculate lateral position using camera geometry
         # X = (center_x - image_center_x) * depth / focal_length
@@ -246,6 +257,124 @@ class DistanceEstimator:
         return distance
 
 
+class BGSRegistry:
+    """Two-layer stable-ID registry for person and bag tracks."""
+
+    PERSON_BASE_ID = 1_000_000
+    BAG_BASE_ID = 2_000_000
+
+    def __init__(self):
+        self.config = BGSConfig
+        self.entries: Dict[int, Dict] = {}
+        self.next_person_id = 1
+        self.next_bag_id = 1
+        self.used_ids_by_frame: Dict[int, set] = {}
+
+    def resolve(self, bbox: List[float], class_id: int, frame_number: int,
+                bt_id: Optional[int] = None) -> int:
+        self._expire(frame_number)
+        used_ids = self.used_ids_by_frame.setdefault(frame_number, set())
+        centroid_thresh = (
+            self.config.REID_CENTROID_THRESH
+            if class_id == self.config.PERSON_CLASS_ID
+            else self.config.REID_BAG_CENTROID_THRESH
+        )
+
+        if bt_id is not None:
+            for stable_id, entry in self.entries.items():
+                if stable_id in used_ids:
+                    continue
+                if entry['class_id'] == class_id and bt_id in entry['bt_ids']:
+                    self._update(stable_id, bbox, frame_number, bt_id)
+                    used_ids.add(stable_id)
+                    return stable_id
+
+        best_id = None
+        best_score = (-1.0, float('-inf'))
+        cx, cy = self._centroid(bbox)
+
+        for stable_id, entry in self.entries.items():
+            if entry['class_id'] != class_id or stable_id in used_ids:
+                continue
+
+            age = frame_number - entry['last_frame']
+            if age < 0 or age > self.config.REID_MATCH_MAX_AGE_FRAMES:
+                continue
+
+            iou = self._iou(bbox, entry['bbox'])
+            ex, ey = self._centroid(entry['bbox'])
+            centroid_dist = float(np.hypot(cx - ex, cy - ey))
+
+            if centroid_dist > centroid_thresh and iou < self.config.REID_IOU_THRESH:
+                continue
+
+            score = (iou, -centroid_dist)
+            if score > best_score:
+                best_score = score
+                best_id = stable_id
+
+        if best_id is not None:
+            self._update(best_id, bbox, frame_number, bt_id)
+            used_ids.add(best_id)
+            return best_id
+
+        new_id = self._new_id(class_id)
+        self.entries[new_id] = {
+            'bbox': bbox,
+            'class_id': class_id,
+            'last_frame': frame_number,
+            'bt_ids': {bt_id} if bt_id is not None else set(),
+        }
+        used_ids.add(new_id)
+        return new_id
+
+    def _update(self, stable_id: int, bbox: List[float], frame_number: int,
+                bt_id: Optional[int]):
+        entry = self.entries[stable_id]
+        entry['bbox'] = bbox
+        entry['last_frame'] = frame_number
+        if bt_id is not None:
+            entry['bt_ids'].add(bt_id)
+
+    def _expire(self, frame_number: int):
+        self.entries = {
+            k: v for k, v in self.entries.items()
+            if frame_number - v['last_frame'] <= self.config.REID_MAX_AGE_FRAMES
+        }
+        self.used_ids_by_frame = {
+            k: v for k, v in self.used_ids_by_frame.items()
+            if k >= frame_number - 2
+        }
+
+    def _new_id(self, class_id: int) -> int:
+        if class_id == self.config.PERSON_CLASS_ID:
+            stable_id = self.PERSON_BASE_ID + self.next_person_id
+            self.next_person_id += 1
+            return stable_id
+
+        stable_id = self.BAG_BASE_ID + self.next_bag_id
+        self.next_bag_id += 1
+        return stable_id
+
+    @staticmethod
+    def _centroid(bbox: List[float]) -> Tuple[float, float]:
+        return (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+
+    @staticmethod
+    def _iou(bbox_a: List[float], bbox_b: List[float]) -> float:
+        ax1, ay1, ax2, ay2 = bbox_a
+        bx1, by1, bx2, by2 = bbox_b
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        if inter == 0:
+            return 0.0
+        union = ((ax2 - ax1) * (ay2 - ay1)) + ((bx2 - bx1) * (by2 - by1)) - inter
+        return inter / union if union > 0 else 0.0
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 3: BAG STATE (Section 7.2 - Ownership States)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -267,12 +396,12 @@ class BagState:
     last_close_time: float = 0.0
     candidate_owner: Optional[int] = None
     candidate_since: float = 0.0
-    distance_history: Deque[float] = None
+    owner_distance_history: Deque[float] = None
     status: str = "OK"  # OK, POTENTIAL, UNATTENDED
     
     def __post_init__(self):
-        if self.distance_history is None:
-            self.distance_history = deque(maxlen=BGSConfig.DISTANCE_HISTORY_SIZE)
+        if self.owner_distance_history is None:
+            self.owner_distance_history = deque(maxlen=BGSConfig.DISTANCE_HISTORY_SIZE)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -342,19 +471,30 @@ class OwnershipManager:
             # Sort by distance (closest first)
             person_distances.sort(key=lambda x: x[1])
             
-            # Update distance history with smoothed value
-            if person_distances:
-                closest_distance = person_distances[0][1]
-                bag_state.distance_history.append(closest_distance)
-                
-                # Calculate smoothed distance (Section 7.1 - Trend-based)
-                smoothed_distance = np.mean(list(bag_state.distance_history))
-            else:
-                smoothed_distance = 999.0  # No person detected
+            owner_distance = None
+            if bag_state.owner_id is not None:
+                for pid, dist in person_distances:
+                    if pid == bag_state.owner_id:
+                        owner_distance = dist
+                        break
+
+            sample_distance = (
+                owner_distance
+                if owner_distance is not None
+                else (person_distances[0][1] if person_distances else 999.0)
+            )
+            bag_state.owner_distance_history.append(sample_distance)
+            smoothed_distance = float(np.mean(list(bag_state.owner_distance_history)))
+
+            closest_distance = person_distances[0][1] if person_distances else 999.0
             
             # Apply ownership rules (Section 7.3)
             self._apply_ownership_rules(
-                bag_state, person_distances, smoothed_distance, current_time
+                bag_state,
+                person_distances,
+                closest_distance,
+                owner_distance,
+                current_time,
             )
             
             # Update bag status (Section 8 - Unattended Logic)
@@ -362,9 +502,11 @@ class OwnershipManager:
         
         return self.bag_states
     
-    def _apply_ownership_rules(self, bag_state: BagState, 
+    def _apply_ownership_rules(self, bag_state: BagState,
                                person_distances: List[Tuple[int, float]],
-                               smoothed_distance: float, current_time: float):
+                               closest_distance: float,
+                               owner_distance: Optional[float],
+                               current_time: float):
         """
         Apply ownership assignment rules (Section 7.3)
         
@@ -378,11 +520,11 @@ class OwnershipManager:
             # No people detected
             return
         
-        closest_person_id, closest_distance = person_distances[0]
+        closest_person_id, _ = person_distances[0]
         
         # CASE 1: Bag has NO owner
         if bag_state.owner_id is None:
-            if smoothed_distance <= self.config.ASSIGNMENT_DISTANCE:
+            if closest_distance <= self.config.ASSIGNMENT_DISTANCE:
                 # Person is close - check confirmation time
                 if bag_state.candidate_owner == closest_person_id:
                     # Same candidate - check if confirmed
@@ -402,39 +544,37 @@ class OwnershipManager:
                 bag_state.candidate_owner = None
         
         # CASE 2: Bag HAS owner
-        else:
-            current_owner_id = bag_state.owner_id
-            
-            # Find current owner's distance
-            owner_distance = None
-            for pid, dist in person_distances:
-                if pid == current_owner_id:
-                    owner_distance = dist
-                    break
-            
-            # Check if owner is close
-            if owner_distance is not None and owner_distance <= self.config.ASSIGNMENT_DISTANCE:
-                # Owner still close
-                bag_state.last_close_time = current_time
-            else:
-                # Owner is far - check if should switch
-                time_locked = current_time - bag_state.owner_since
-                
-                if time_locked >= self.config.OWNERSHIP_LOCK_TIME:
-                    # Lock period over - can consider switching
-                    
-                    if smoothed_distance <= self.config.ASSIGNMENT_DISTANCE:
-                        # Someone else is close
-                        if owner_distance is None:
-                            # Current owner not detected - switch immediately
-                            bag_state.owner_id = closest_person_id
-                            bag_state.owner_since = current_time
-                            bag_state.last_close_time = current_time
-                        elif owner_distance - closest_distance >= self.config.SWITCH_DISTANCE_IMPROVEMENT:
-                            # New person significantly closer - switch
-                            bag_state.owner_id = closest_person_id
-                            bag_state.owner_since = current_time
-                            bag_state.last_close_time = current_time
+        release_after = self.config.UNATTENDED_THRESHOLD + self.config.OWNERSHIP_RELEASE_GRACE
+        if (current_time - bag_state.last_close_time >= release_after) and owner_distance is None:
+            bag_state.owner_id = None
+            bag_state.owner_since = 0.0
+            bag_state.candidate_owner = None
+            bag_state.owner_distance_history.clear()
+            return
+
+        if owner_distance is not None and owner_distance <= self.config.ASSIGNMENT_DISTANCE:
+            bag_state.last_close_time = current_time
+
+        time_locked = current_time - bag_state.owner_since
+        if time_locked < self.config.OWNERSHIP_LOCK_TIME:
+            return
+
+        owner_close = owner_distance is not None and owner_distance <= self.config.ASSIGNMENT_DISTANCE
+        if owner_close or closest_distance > self.config.ASSIGNMENT_DISTANCE:
+            return
+
+        if owner_distance is None:
+            bag_state.owner_id = closest_person_id
+            bag_state.owner_since = current_time
+            bag_state.last_close_time = current_time
+            bag_state.owner_distance_history.clear()
+            return
+
+        if owner_distance - closest_distance >= self.config.SWITCH_DISTANCE_IMPROVEMENT:
+            bag_state.owner_id = closest_person_id
+            bag_state.owner_since = current_time
+            bag_state.last_close_time = current_time
+            bag_state.owner_distance_history.clear()
     
     def _update_bag_status(self, bag_state: BagState, current_time: float):
         """
@@ -445,6 +585,11 @@ class OwnershipManager:
         - POTENTIAL: Owner far for short period
         - UNATTENDED: Owner absent/far for prolonged period
         """
+        if bag_state.owner_distance_history:
+            smoothed_owner_distance = float(np.mean(list(bag_state.owner_distance_history)))
+            if smoothed_owner_distance <= self.config.ASSIGNMENT_DISTANCE:
+                bag_state.last_close_time = current_time
+
         time_since_close = current_time - bag_state.last_close_time
         
         if time_since_close >= self.config.UNATTENDED_THRESHOLD:
@@ -648,7 +793,7 @@ class BagGuardSystem:
     
     def __init__(self, model_path: str, video_path: str, output_path: str,
                  imgsz: int, max_fps: float, skip: int, half: bool,
-                 tracker_profile: str = "main"):
+                 tracker_profile: str = "main", show: bool = False):
         self.model_path = model_path
         self.video_path = video_path
         self.output_path = output_path
@@ -656,6 +801,7 @@ class BagGuardSystem:
         self.max_fps = float(max_fps)
         self.skip = max(0, int(skip))
         self.half = bool(half)
+        self.show = bool(show)
         self.tracker_profile = str(tracker_profile).strip().lower()
         self.config = BGSConfig
         resolved_model_path = os.path.abspath(model_path)
@@ -705,6 +851,7 @@ class BagGuardSystem:
         self.distance_estimator = DistanceEstimator()
         self.ownership_manager = OwnershipManager(self.distance_estimator)
         self.visualizer = Visualizer()
+        self.id_registry = BGSRegistry()
         
         print("✓ Distance Estimator initialized")
         print("✓ Ownership Manager initialized")
@@ -716,32 +863,6 @@ class BagGuardSystem:
         self.person_ids_seen = set()
         self.bag_ids_seen = set()
         self.start_time = None
-        self.previous_bags = {}
-        self.next_bag_stable_id = 1
-        self.bag_id_flip_count = 0
-        self.bag_flip_window_start = 0
-        self.bag_flip_debug_tracks = {}
-        self.next_bag_flip_debug_id = 1
-
-    def _calculate_iou(self, bbox1: List[float], bbox2: List[float]) -> float:
-        """Calculate IoU between two bounding boxes [x1, y1, x2, y2]."""
-        x1 = max(bbox1[0], bbox2[0])
-        y1 = max(bbox1[1], bbox2[1])
-        x2 = min(bbox1[2], bbox2[2])
-        y2 = min(bbox1[3], bbox2[3])
-
-        inter_w = max(0.0, x2 - x1)
-        inter_h = max(0.0, y2 - y1)
-        inter_area = inter_w * inter_h
-
-        area1 = max(0.0, bbox1[2] - bbox1[0]) * max(0.0, bbox1[3] - bbox1[1])
-        area2 = max(0.0, bbox2[2] - bbox2[0]) * max(0.0, bbox2[3] - bbox2[1])
-        union_area = area1 + area2 - inter_area
-
-        if union_area <= 0.0:
-            return 0.0
-
-        return inter_area / union_area
 
     def _validate_class_config(self):
         expected_ids = self.config.EXPECTED_CLASS_IDS
@@ -811,72 +932,6 @@ class BagGuardSystem:
 
         print(f"✓ Tracker config loaded: {tracker_file}")
         return str(tracker_file)
-
-    def _update_bag_id_flip_debug(self, boxes):
-        if boxes is None or len(boxes) == 0:
-            return
-
-        active_debug_ids = set()
-        threshold = self.config.BAG_MATCH_THRESHOLD_PX
-
-        for i in range(len(boxes)):
-            cls_id = int(boxes[i].cls[0])
-            if cls_id not in self.config.BAG_CLASS_IDS:
-                continue
-            if boxes[i].id is None:
-                continue
-
-            current_track_id = int(boxes[i].id[0])
-            bbox = boxes[i].xyxy[0].cpu().numpy().tolist()
-            center_x = (bbox[0] + bbox[2]) / 2
-            center_y = (bbox[1] + bbox[3]) / 2
-
-            best_debug_id = None
-            best_dist = float('inf')
-
-            for debug_id, data in self.bag_flip_debug_tracks.items():
-                prev_x, prev_y = data['center']
-                dist = np.sqrt((center_x - prev_x)**2 + (center_y - prev_y)**2)
-                if dist < threshold and dist < best_dist:
-                    best_dist = dist
-                    best_debug_id = debug_id
-
-            if best_debug_id is None:
-                best_debug_id = self.next_bag_flip_debug_id
-                self.next_bag_flip_debug_id += 1
-                self.bag_flip_debug_tracks[best_debug_id] = {
-                    'center': (center_x, center_y),
-                    'last_id': current_track_id,
-                    'last_seen': self.inference_frame_count
-                }
-            else:
-                data = self.bag_flip_debug_tracks[best_debug_id]
-                if data['last_id'] != current_track_id:
-                    self.bag_id_flip_count += 1
-                data['center'] = (center_x, center_y)
-                data['last_id'] = current_track_id
-                data['last_seen'] = self.inference_frame_count
-
-            active_debug_ids.add(best_debug_id)
-
-        self.bag_flip_debug_tracks = {
-            debug_id: data
-            for debug_id, data in self.bag_flip_debug_tracks.items()
-            if (self.inference_frame_count - data['last_seen'] <= self.config.BAG_FRAME_MEMORY)
-            or (debug_id in active_debug_ids)
-        }
-
-        if self.bag_flip_window_start == 0:
-            self.bag_flip_window_start = self.inference_frame_count
-
-        window_size = self.inference_frame_count - self.bag_flip_window_start
-        if window_size >= 300:
-            print(
-                f"[DEBUG][BAG_ID_FLIP_SUMMARY] frames={self.bag_flip_window_start}-{self.inference_frame_count} "
-                f"id_flips={self.bag_id_flip_count} active_spatial_tracks={len(self.bag_flip_debug_tracks)}"
-            )
-            self.bag_id_flip_count = 0
-            self.bag_flip_window_start = self.inference_frame_count
 
     def _run_startup_inference(self):
         cap = cv2.VideoCapture(self.video_path)
@@ -948,18 +1003,14 @@ class BagGuardSystem:
                 if conf < self.config.BAG_CONF:
                     continue
             
-            # Get or create tracking ID
+            bt_id = int(boxes[i].id[0]) if boxes[i].id is not None else None
+            stable_id = self.id_registry.resolve(bbox, cls_id, self.frame_count, bt_id)
+
             if cls_id == 0:  # PERSON
-                if boxes[i].id is not None:
-                    track_id = int(boxes[i].id[0])
-                else:
-                    track_id = 10000 + i
-                
-                # Estimate 3D position
                 position_3d = self.distance_estimator.estimate_position_3d(bbox, is_person=True)
-                
+
                 detection = {
-                    'id': track_id,
+                    'id': stable_id,
                     'class': class_name,
                     'class_id': cls_id,
                     'bbox': bbox,
@@ -967,24 +1018,13 @@ class BagGuardSystem:
                     'position_3d': position_3d
                 }
                 people.append(detection)
-                self.person_ids_seen.add(track_id)
+                self.person_ids_seen.add(stable_id)
                 
             else:  # BAGS
-                # Prefer ByteTrack bag ID when available; fallback to spatial matching
-                if boxes[i].id is not None:
-                    track_id = 2000000 + int(boxes[i].id[0])
-                else:
-                    matched_id = self._match_bag_to_previous(bbox, cls_id)
-                    if matched_id is not None:
-                        track_id = 2000000 + matched_id
-                    else:
-                        track_id = 2000000 + (cls_id * 100000 + i)
-                
-                # Estimate 3D position
                 position_3d = self.distance_estimator.estimate_position_3d(bbox, is_person=False)
                 
                 detection = {
-                    'id': track_id,
+                    'id': stable_id,
                     'class': class_name,
                     'class_id': cls_id,
                     'bbox': bbox,
@@ -992,54 +1032,34 @@ class BagGuardSystem:
                     'position_3d': position_3d
                 }
                 bags.append(detection)
-                self.bag_ids_seen.add(track_id)
+                self.bag_ids_seen.add(stable_id)
         
         return people, bags
-    
-    def _match_bag_to_previous(self, current_bbox, cls_id):
-        """Match bags frame-to-frame"""
-        if not self.previous_bags:
-            return None
-        
-        curr_cx = (current_bbox[0] + current_bbox[2]) / 2
-        curr_cy = (current_bbox[1] + current_bbox[3]) / 2
-        
-        best_iou = -1.0
-        min_dist = float('inf')
-        matched_id = None
-        threshold = self.config.BAG_MATCH_THRESHOLD_PX
-        
-        for bag_id, (prev_bbox, prev_cls, last_frame) in self.previous_bags.items():
-            if prev_cls != cls_id:
-                continue
-            if self.inference_frame_count - last_frame > self.config.BAG_FRAME_MEMORY:
-                continue
-            
-            prev_cx = (prev_bbox[0] + prev_bbox[2]) / 2
-            prev_cy = (prev_bbox[1] + prev_bbox[3]) / 2
-            
-            dist = np.sqrt((curr_cx - prev_cx)**2 + (curr_cy - prev_cy)**2)
-            iou = self._calculate_iou(current_bbox, prev_bbox)
-            
-            if dist < threshold or iou > 0.3:
-                if iou > best_iou or (iou == best_iou and dist < min_dist):
-                    best_iou = iou
-                    min_dist = dist
-                    matched_id = bag_id
-        
-        if matched_id:
-            self.previous_bags[matched_id] = (current_bbox, cls_id, self.inference_frame_count)
-        else:
-            new_id = cls_id * 100000 + self.next_bag_stable_id
-            self.next_bag_stable_id += 1
-            self.previous_bags[new_id] = (current_bbox, cls_id, self.inference_frame_count)
-            matched_id = new_id
-        
-        # Cleanup
-        self.previous_bags = {k: v for k, v in self.previous_bags.items()
-                             if self.inference_frame_count - v[2] <= self.config.BAG_FRAME_MEMORY}
-        
-        return matched_id
+
+    def _refine_bag_depths(self, bags: List[Dict], people: List[Dict]):
+        if not people:
+            return
+
+        for bag in bags:
+            bx1, by1, bx2, by2 = bag['bbox']
+            bcx = (bx1 + bx2) / 2
+            bcy = (by1 + by2) / 2
+            best_depth = None
+            best_dist = 200.0
+
+            for person in people:
+                px1, py1, px2, py2 = person['bbox']
+                pcx = (px1 + px2) / 2
+                pcy = (py1 + py2) / 2
+                dist = float(np.hypot(bcx - pcx, bcy - pcy))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_depth = person['position_3d'][2]
+
+            if best_depth is not None:
+                bag['position_3d'] = self.distance_estimator.estimate_position_3d(
+                    bag['bbox'], is_person=False, reference_depth=best_depth
+                )
     
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict]:
         """Process single frame through complete pipeline"""
@@ -1059,34 +1079,9 @@ class BagGuardSystem:
             verbose=False
         )
 
-        self._update_bag_id_flip_debug(results[0].boxes)
-
-        # Debug: print bag detections every 30 frames
-        if self.frame_count % 30 == 0:
-            boxes = results[0].boxes
-            bag_debug_count = 0
-
-            if boxes is not None and len(boxes) > 0:
-                for i in range(len(boxes)):
-                    cls_id = int(boxes[i].cls[0])
-                    if cls_id in self.config.BAG_CLASS_IDS:
-                        bag_debug_count += 1
-                        bag_class = self.config.TARGET_CLASSES.get(cls_id, f"class_{cls_id}")
-                        conf = float(boxes[i].conf[0])
-                        bbox = boxes[i].xyxy[0].cpu().numpy().tolist()
-                        print(
-                            f"[DEBUG][BAG_DET] frame={self.frame_count} "
-                            f"class={bag_class} conf={conf:.3f} bbox={bbox}"
-                        )
-
-            if bag_debug_count == 0:
-                print(
-                    f"[DEBUG][BAG_DET] frame={self.frame_count} "
-                    f"NO bag detections for classes {self.config.BAG_CLASS_IDS}"
-                )
-        
         # Extract with 3D positions
         people, bags = self.extract_detections(results)
+        self._refine_bag_depths(bags, people)
         
         # Update ownership
         bag_states = self.ownership_manager.update_ownership(bags, people, current_time)
@@ -1193,15 +1188,20 @@ class BagGuardSystem:
                     }
 
                 out.write(annotated_frame)
-                cv2.imshow('BGS - Full Specification', annotated_frame)
+                if self.show:
+                    cv2.imshow('BGS - Full Specification', annotated_frame)
 
                 if do_infer and self.frame_count % 30 == 0:
-                    progress = (self.frame_count / total_frames) * 100 if total_frames > 0 else 0
-                    print(f"Progress: {progress:5.1f}% | Frame: {self.frame_count:5d}/{total_frames} | "
-                          f"FPS: {stats['fps']:3d} | People: {stats['people_count']} | "
+                    if total_frames > 0:
+                        progress = (self.frame_count / total_frames) * 100
+                        prefix = f"Progress: {progress:5.1f}% | Frame: {self.frame_count:5d}/{total_frames}"
+                    else:
+                        prefix = f"LIVE | Frame: {self.frame_count:5d}"
+
+                    print(f"{prefix} | FPS: {stats['fps']:3d} | People: {stats['people_count']} | "
                           f"Bags: {stats['bags_count']} | Unattended: {stats['bags_unattended']}")
 
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                if self.show and cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
                 if self.max_fps > 0:
@@ -1269,7 +1269,10 @@ def main():
 
     model_path = Path(args.model)
     if not model_path.is_absolute():
-        if model_path.parent == Path("."):
+        candidate = root / model_path
+        if candidate.exists():
+            model_path = candidate
+        elif model_path.parent == Path("."):
             model_path = root / "models" / model_path
         else:
             model_path = root / model_path
@@ -1308,6 +1311,7 @@ def main():
         skip=args.skip,
         half=args.half,
         tracker_profile=args.tracker_profile,
+        show=args.show,
     )
     success = system.run()
     
