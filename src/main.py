@@ -26,6 +26,8 @@ Date: February 2026
 """
 
 import argparse
+import json
+import pickle
 from pathlib import Path
 import cv2
 import numpy as np
@@ -33,6 +35,7 @@ from ultralytics import YOLO
 import time
 from collections import deque
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List, Dict, Tuple, Optional, Deque
 import sys
 import os
@@ -110,44 +113,55 @@ class BGSConfig:
     # ═══════════════════════════════════════════════════════════════════════
     # SECTION 7: OWNERSHIP PERSISTENCE LOGIC
     # ═══════════════════════════════════════════════════════════════════════
-    # Section 7.1: Trend-Based Decision (NOT frame-by-frame)
-    DISTANCE_HISTORY_SIZE = 30      # frames (rolling window)
-    
-    # Section 7.3: Assignment Rules
-    ASSIGNMENT_DISTANCE = 2.5       # meters - close enough to be owner
-    CONFIRMATION_TIME = 2.0         # seconds - time to confirm ownership
-    OWNERSHIP_LOCK_TIME = 10.0      # seconds - ownership locked after assignment
-    SWITCH_DISTANCE_IMPROVEMENT = 1.5  # meters - required to switch owner
+    DISTANCE_HISTORY_SIZE = 30
+    ASSIGNMENT_DISTANCE = 2.5
+    CONFIRMATION_TIME = 2.0
+    OWNERSHIP_LOCK_TIME = 10.0
+    SWITCH_DISTANCE_IMPROVEMENT = 1.5
     
     # ═══════════════════════════════════════════════════════════════════════
     # SECTION 8: UNATTENDED BAG LOGIC
     # ═══════════════════════════════════════════════════════════════════════
-    # Section 8.1: Three-state status (OK, POTENTIAL, UNATTENDED)
-    POTENTIAL_THRESHOLD = 5.0       # seconds - owner far, becoming potential
-    UNATTENDED_THRESHOLD = 10.0     # seconds - prolonged absence = unattended
-    OWNERSHIP_RELEASE_GRACE = 5.0   # seconds - release owner after prolonged absence
+    POTENTIAL_THRESHOLD = 5.0
+    UNATTENDED_THRESHOLD = 10.0
+    OWNERSHIP_RELEASE_GRACE = 5.0
 
     # Two-layer identity persistence (registry)
     REID_MAX_AGE_FRAMES = 900
     REID_MATCH_MAX_AGE_FRAMES = 240
+    REID_APPEARANCE_MAX_AGE_FRAMES = 600
     REID_CENTROID_THRESH = 80
     REID_BAG_CENTROID_THRESH = 60
     REID_IOU_THRESH = 0.25
+    REID_PERSON_MODEL_NAME = "osnet_x1_0"
+    REID_PERSON_MODEL_PATH = "models/reid/osnet_x1_0_msmt17.pt"
+    REID_PERSON_EMBED_THRESHOLD = 0.58
+    REID_PERSON_INPUT_SIZE = (256, 128)
+    REID_PERSON_MIN_CROP_SIZE = 32
+    REID_PERSON_SIZE_RATIO_MIN = 0.40
+    REID_PERSON_ASPECT_RATIO_MAX_DIFF = 0.55
+    REID_APPEARANCE_UPDATE_WEIGHT = 0.20
+    REID_PERSON_GALLERY_SIZE = 12
+    REID_PERSON_APPEARANCE_PRIORITY = 0.04
+    REID_PERSIST_PATH = "logs/person_reid/person_registry.pkl"
+    REID_PERSIST_LOG_DIR = "logs/person_reid"
+    REID_PERSIST_INTERVAL_FRAMES = 30
+    REID_PERSIST_MAX_AGE_SECONDS = 43200.0
+    REID_FRAME_IMAGE_DIRNAME = "frames"
+    REID_FRAME_METADATA_NAME = "frames.jsonl"
+    REID_FRAME_IMAGE_EXT = ".jpg"
     
     # ═══════════════════════════════════════════════════════════════════════
     # SECTION 10: VISUALIZATION
     # ═══════════════════════════════════════════════════════════════════════
-    # Professional color scheme (different colors per status)
-    COLOR_PERSON = (50, 205, 50)           # Lime Green
-    COLOR_BAG_OK = (255, 165, 0)           # Orange (owner close)
-    COLOR_BAG_POTENTIAL = (0, 165, 255)    # Orange-Yellow (potentially unattended)
-    COLOR_BAG_UNATTENDED = (0, 0, 255)     # Red (unattended)
-    COLOR_DISTANCE_LINE = (255, 255, 0)    # Cyan (distance line)
-    COLOR_TEXT = (255, 255, 255)           # White
-    COLOR_BG = (30, 30, 30)                # Dark gray
-    COLOR_HIGHLIGHT = (0, 255, 255)        # Cyan
-    
-    # Visual settings
+    COLOR_PERSON = (50, 205, 50)
+    COLOR_BAG_OK = (255, 165, 0)
+    COLOR_BAG_POTENTIAL = (0, 165, 255)
+    COLOR_BAG_UNATTENDED = (0, 0, 255)
+    COLOR_DISTANCE_LINE = (255, 255, 0)
+    COLOR_TEXT = (255, 255, 255)
+    COLOR_BG = (30, 30, 30)
+    COLOR_HIGHLIGHT = (0, 255, 255)
     SHOW_DISTANCE_LINES = True
     SHOW_DISTANCE_LABELS = True
     SHOW_DEBUG_OVERLAY = True
@@ -160,118 +174,137 @@ class BGSConfig:
 # SECTION 2: DISTANCE ESTIMATOR (Section 6.2 - Monocular Trigonometry)
 # ═══════════════════════════════════════════════════════════════════════════
 class DistanceEstimator:
-    """
-    Monocular distance estimation using trigonometry (Section 6.2)
-    
-    Method:
-    1. Estimate depth (Z) using person height and bbox height
-    2. Calculate lateral position (X, Y) using camera geometry
-    3. Compute 3D Euclidean distance between objects
-    
-    Formula:
-    Z = (real_height × focal_length) / bbox_height_pixels
-    """
-    
     def __init__(self):
         self.config = BGSConfig
-    
-    def estimate_depth(self, bbox_height_pixels: float, 
-                      real_height_meters: float = None) -> float:
-        """
-        Estimate depth (Z distance) from camera using person height
-        
-        Args:
-            bbox_height_pixels: Height of bounding box in pixels
-            real_height_meters: Real-world height (default: assumed person height)
-            
-        Returns:
-            Depth in meters
-        """
+
+    def estimate_depth(self, bbox_height_pixels: float, real_height_meters: float = None) -> float:
         if real_height_meters is None:
             real_height_meters = self.config.ASSUMED_PERSON_HEIGHT
-        
         if bbox_height_pixels < 1:
-            return 10.0  # Far away default
-        
-        # Z = (real_height × focal_length) / bbox_height
-        depth = (real_height_meters * self.config.FOCAL_LENGTH) / bbox_height_pixels
-        
-        return depth
-    
+            return 10.0
+        return (real_height_meters * self.config.FOCAL_LENGTH) / bbox_height_pixels
+
     def estimate_position_3d(self, bbox: List[float],
                             is_person: bool = False,
                             reference_depth: Optional[float] = None) -> Tuple[float, float, float]:
-        """
-        Estimate 3D position (X, Y, Z) in meters
-        
-        Args:
-            bbox: [x1, y1, x2, y2] bounding box
-            is_person: Whether this is a person (for height estimation)
-            
-        Returns:
-            (x_meters, y_meters, depth_meters)
-        """
         x1, y1, x2, y2 = bbox
-        
-        # Center of bounding box (pixels)
         center_x = (x1 + x2) / 2
         center_y = (y1 + y2) / 2
         bbox_height = y2 - y1
-        
-        # Estimate depth
+
         if is_person and bbox_height > 50:
-            # Use person height for accurate depth
             depth = self.estimate_depth(bbox_height, self.config.ASSUMED_PERSON_HEIGHT)
         elif reference_depth is not None:
             depth = reference_depth
         else:
             depth = self.estimate_depth(bbox_height, self.config.ASSUMED_BAG_HEIGHT)
-        
-        # Calculate lateral position using camera geometry
-        # X = (center_x - image_center_x) * depth / focal_length
+
         image_center_x = self.config.IMAGE_WIDTH / 2
         image_center_y = self.config.IMAGE_HEIGHT / 2
-        
         x_meters = ((center_x - image_center_x) * depth) / self.config.FOCAL_LENGTH
         y_meters = ((center_y - image_center_y) * depth) / self.config.FOCAL_LENGTH
-        
         return x_meters, y_meters, depth
-    
+
     def calculate_distance(self, pos1: Tuple[float, float, float],
                           pos2: Tuple[float, float, float]) -> float:
-        """
-        Calculate 3D Euclidean distance between two positions
-        
-        Args:
-            pos1: (x, y, z) in meters
-            pos2: (x, y, z) in meters
-            
-        Returns:
-            Distance in meters
-        """
         x1, y1, z1 = pos1
         x2, y2, z2 = pos2
-        
-        distance = np.sqrt((x2 - x1)**2 + (y2 - y1)**2 + (z2 - z1)**2)
-        
-        return distance
+        return np.sqrt((x2 - x1)**2 + (y2 - y1)**2 + (z2 - z1)**2)
+
+
+class PersonReIDEmbedder:
+    """OSNet-based feature extractor for person re-identification."""
+
+    def __init__(self, device: str, model_name: str, model_path: str = ""):
+        self.config = BGSConfig
+        self.device = "cuda" if str(device).startswith("cuda") else "cpu"
+        self.model_name = model_name
+        self.model_path = model_path
+        self.extractor = None
+
+        try:
+            from torchreid.reid.utils.feature_extractor import FeatureExtractor
+
+            self.extractor = FeatureExtractor(
+                model_name=self.model_name,
+                model_path=self.model_path,
+                image_size=self.config.REID_PERSON_INPUT_SIZE,
+                device=self.device,
+                verbose=False,
+            )
+            source = self.model_path if self.model_path else f"pretrained {self.model_name}"
+            print(f"✓ Person re-ID extractor loaded: {source}")
+        except Exception as e:
+            print(f"⚠️  Person re-ID disabled: {e}")
+
+    @property
+    def enabled(self) -> bool:
+        return self.extractor is not None
+
+    def crop_person(self, frame: np.ndarray, bbox: List[float]) -> Optional[np.ndarray]:
+        frame_h, frame_w = frame.shape[:2]
+        x1 = max(0, min(frame_w - 1, int(bbox[0])))
+        y1 = max(0, min(frame_h - 1, int(bbox[1])))
+        x2 = max(0, min(frame_w, int(bbox[2])))
+        y2 = max(0, min(frame_h, int(bbox[3])))
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+
+        crop_h, crop_w = crop.shape[:2]
+        if crop_h < self.config.REID_PERSON_MIN_CROP_SIZE or crop_w < self.config.REID_PERSON_MIN_CROP_SIZE:
+            return None
+
+        inset_x = max(1, int(crop_w * 0.18))
+        top_trim = max(1, int(crop_h * 0.10))
+        bottom_trim = max(1, int(crop_h * 0.05))
+        center = crop[top_trim:crop_h - bottom_trim, inset_x:crop_w - inset_x]
+        if center.size != 0:
+            crop = center
+
+        return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+
+    def extract(self, crops: List[np.ndarray]) -> List[Optional[np.ndarray]]:
+        if not crops or not self.enabled:
+            return [None] * len(crops)
+        try:
+            features = self.extractor(crops)
+        except Exception as e:
+            print(f"⚠️  Person re-ID inference failed: {e}")
+            return [None] * len(crops)
+
+        embeddings = []
+        for feature in features:
+            vector = feature.detach().cpu().numpy().astype(np.float32)
+            norm = float(np.linalg.norm(vector))
+            embeddings.append(vector / norm if norm > 0 else None)
+        return embeddings
 
 
 class BGSRegistry:
-    """Two-layer stable-ID registry for person and bag tracks."""
+    """Stable-ID registry for person and bag tracks."""
 
     PERSON_BASE_ID = 1_000_000
     BAG_BASE_ID = 2_000_000
 
-    def __init__(self):
+    def __init__(self, persist_path: Optional[Path] = None, persist_log_dir: Optional[Path] = None):
         self.config = BGSConfig
         self.entries: Dict[int, Dict] = {}
         self.next_person_id = 1
         self.next_bag_id = 1
         self.used_ids_by_frame: Dict[int, set] = {}
+        self.persist_path = Path(persist_path) if persist_path is not None else None
+        self.persist_log_dir = Path(persist_log_dir) if persist_log_dir is not None else None
+        self.loaded_person_count = 0
+        self.load_persistent_entries()
 
     def resolve(self, bbox: List[float], class_id: int, frame_number: int,
-                bt_id: Optional[int] = None) -> int:
+                bt_id: Optional[int] = None,
+                appearance: Optional[np.ndarray] = None) -> Tuple[int, Dict[str, float | str]]:
         self._expire(frame_number)
         used_ids = self.used_ids_by_frame.setdefault(frame_number, set())
         centroid_thresh = (
@@ -285,16 +318,116 @@ class BGSRegistry:
                 if stable_id in used_ids:
                     continue
                 if entry['class_id'] == class_id and bt_id in entry['bt_ids']:
-                    self._update(stable_id, bbox, frame_number, bt_id)
+                    self._update(stable_id, bbox, frame_number, bt_id, appearance)
                     used_ids.add(stable_id)
-                    return stable_id
+                    return stable_id, {'reason': 'track', 'score': 1.0}
 
+        if class_id == self.config.PERSON_CLASS_ID and appearance is not None:
+            appearance_id, appearance_score = self._match_person_by_appearance(
+                bbox, appearance, frame_number, used_ids
+            )
+            if appearance_id is not None:
+                geometry_id, geometry_meta = self._match_by_geometry(
+                    bbox, class_id, frame_number, used_ids, centroid_thresh
+                )
+                if geometry_id is not None and geometry_id != appearance_id:
+                    geometry_iou = float(geometry_meta.get('iou', 0.0))
+                    appearance_margin = appearance_score - self.config.REID_PERSON_EMBED_THRESHOLD
+                    if geometry_iou >= self.config.REID_IOU_THRESH and appearance_margin < self.config.REID_PERSON_APPEARANCE_PRIORITY:
+                        self._update(geometry_id, bbox, frame_number, bt_id, appearance)
+                        used_ids.add(geometry_id)
+                        return geometry_id, geometry_meta
+
+                self._update(appearance_id, bbox, frame_number, bt_id, appearance)
+                used_ids.add(appearance_id)
+                return appearance_id, {'reason': 'reid', 'score': appearance_score}
+
+        best_id, geometry_meta = self._match_by_geometry(
+            bbox, class_id, frame_number, used_ids, centroid_thresh
+        )
+        if best_id is not None:
+            self._update(best_id, bbox, frame_number, bt_id, appearance)
+            used_ids.add(best_id)
+            return best_id, geometry_meta
+
+        new_id = self._new_id(class_id)
+        self.entries[new_id] = {
+            'bbox': bbox,
+            'class_id': class_id,
+            'last_frame': frame_number,
+            'last_seen_ts': time.time(),
+            'bt_ids': {bt_id} if bt_id is not None else set(),
+            'appearance': appearance.copy() if appearance is not None else None,
+            'appearance_gallery': deque(
+                [appearance.copy()] if appearance is not None else [],
+                maxlen=self.config.REID_PERSON_GALLERY_SIZE,
+            ),
+            'persisted_only': False,
+        }
+        used_ids.add(new_id)
+        return new_id, {'reason': 'new', 'score': 0.0}
+
+    def _update(self, stable_id: int, bbox: List[float], frame_number: int,
+                bt_id: Optional[int], appearance: Optional[np.ndarray] = None):
+        entry = self.entries[stable_id]
+        entry['bbox'] = bbox
+        entry['last_frame'] = frame_number
+        entry['last_seen_ts'] = time.time()
+        entry['persisted_only'] = False
+        if bt_id is not None:
+            entry['bt_ids'].add(bt_id)
+        if appearance is not None:
+            existing = entry.get('appearance')
+            if existing is None:
+                entry['appearance'] = appearance.copy()
+            else:
+                alpha = self.config.REID_APPEARANCE_UPDATE_WEIGHT
+                blended = ((1.0 - alpha) * existing) + (alpha * appearance)
+                norm = float(np.linalg.norm(blended))
+                entry['appearance'] = blended / norm if norm > 0 else appearance.copy()
+            gallery = entry.setdefault(
+                'appearance_gallery',
+                deque(maxlen=self.config.REID_PERSON_GALLERY_SIZE)
+            )
+            gallery.append(appearance.copy())
+
+    def _expire(self, frame_number: int):
+        self.entries = {
+            key: value for key, value in self.entries.items()
+            if value.get('class_id') == self.config.PERSON_CLASS_ID
+            or frame_number - value['last_frame'] <= self.config.REID_MAX_AGE_FRAMES
+        }
+        self.used_ids_by_frame = {
+            key: value for key, value in self.used_ids_by_frame.items()
+            if key >= frame_number - 2
+        }
+
+    def _new_id(self, class_id: int) -> int:
+        if class_id == self.config.PERSON_CLASS_ID:
+            stable_id = self.PERSON_BASE_ID + self.next_person_id
+            self.next_person_id += 1
+            return stable_id
+
+        stable_id = self.BAG_BASE_ID + self.next_bag_id
+        self.next_bag_id += 1
+        return stable_id
+
+    @staticmethod
+    def _centroid(bbox: List[float]) -> Tuple[float, float]:
+        return (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+
+    def _match_by_geometry(self, bbox: List[float], class_id: int, frame_number: int,
+                           used_ids: set, centroid_thresh: float) -> Tuple[Optional[int], Optional[Dict[str, float | str]]]:
         best_id = None
         best_score = (-1.0, float('-inf'))
+        best_meta = None
         cx, cy = self._centroid(bbox)
 
         for stable_id, entry in self.entries.items():
             if entry['class_id'] != class_id or stable_id in used_ids:
+                continue
+
+            if entry.get('persisted_only'):
                 continue
 
             age = frame_number - entry['last_frame']
@@ -312,53 +445,65 @@ class BGSRegistry:
             if score > best_score:
                 best_score = score
                 best_id = stable_id
+                best_meta = {
+                    'reason': 'geo',
+                    'score': float(iou),
+                    'iou': float(iou),
+                    'centroid_dist': float(centroid_dist),
+                }
 
-        if best_id is not None:
-            self._update(best_id, bbox, frame_number, bt_id)
-            used_ids.add(best_id)
-            return best_id
+        return best_id, best_meta
 
-        new_id = self._new_id(class_id)
-        self.entries[new_id] = {
-            'bbox': bbox,
-            'class_id': class_id,
-            'last_frame': frame_number,
-            'bt_ids': {bt_id} if bt_id is not None else set(),
-        }
-        used_ids.add(new_id)
-        return new_id
+    def _match_person_by_appearance(self, bbox: List[float], appearance: np.ndarray,
+                                    frame_number: int, used_ids: set) -> Tuple[Optional[int], float]:
+        best_id = None
+        best_similarity = self.config.REID_PERSON_EMBED_THRESHOLD
 
-    def _update(self, stable_id: int, bbox: List[float], frame_number: int,
-                bt_id: Optional[int]):
-        entry = self.entries[stable_id]
-        entry['bbox'] = bbox
-        entry['last_frame'] = frame_number
-        if bt_id is not None:
-            entry['bt_ids'].add(bt_id)
+        for stable_id, entry in self.entries.items():
+            if entry['class_id'] != self.config.PERSON_CLASS_ID or stable_id in used_ids:
+                continue
 
-    def _expire(self, frame_number: int):
-        self.entries = {
-            k: v for k, v in self.entries.items()
-            if frame_number - v['last_frame'] <= self.config.REID_MAX_AGE_FRAMES
-        }
-        self.used_ids_by_frame = {
-            k: v for k, v in self.used_ids_by_frame.items()
-            if k >= frame_number - 2
-        }
+            if entry.get('persisted_only'):
+                last_seen_ts = float(entry.get('last_seen_ts', 0.0))
+                if last_seen_ts <= 0:
+                    continue
+                if time.time() - last_seen_ts > self.config.REID_PERSIST_MAX_AGE_SECONDS:
+                    continue
+            else:
+                age = frame_number - entry['last_frame']
+                if age < 0 or age > self.config.REID_APPEARANCE_MAX_AGE_FRAMES:
+                    continue
 
-    def _new_id(self, class_id: int) -> int:
-        if class_id == self.config.PERSON_CLASS_ID:
-            stable_id = self.PERSON_BASE_ID + self.next_person_id
-            self.next_person_id += 1
-            return stable_id
+            stored_appearance = entry.get('appearance')
+            gallery = entry.get('appearance_gallery') or []
+            if stored_appearance is None and not gallery:
+                continue
 
-        stable_id = self.BAG_BASE_ID + self.next_bag_id
-        self.next_bag_id += 1
-        return stable_id
+            if not self._appearance_size_compatible(bbox, entry['bbox']):
+                continue
 
-    @staticmethod
-    def _centroid(bbox: List[float]) -> Tuple[float, float]:
-        return (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+            similarities = [float(np.dot(appearance, gallery_feature)) for gallery_feature in gallery]
+            if stored_appearance is not None:
+                similarities.append(float(np.dot(appearance, stored_appearance)))
+            similarity = max(similarities) if similarities else -1.0
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_id = stable_id
+
+        return best_id, best_similarity
+
+    def _appearance_size_compatible(self, bbox_a: List[float], bbox_b: List[float]) -> bool:
+        height_a = max(1.0, bbox_a[3] - bbox_a[1])
+        height_b = max(1.0, bbox_b[3] - bbox_b[1])
+        size_ratio = min(height_a, height_b) / max(height_a, height_b)
+        if size_ratio < self.config.REID_PERSON_SIZE_RATIO_MIN:
+            return False
+
+        width_a = max(1.0, bbox_a[2] - bbox_a[0])
+        width_b = max(1.0, bbox_b[2] - bbox_b[0])
+        aspect_a = width_a / height_a
+        aspect_b = width_b / height_b
+        return abs(aspect_a - aspect_b) <= self.config.REID_PERSON_ASPECT_RATIO_MAX_DIFF
 
     @staticmethod
     def _iou(bbox_a: List[float], bbox_b: List[float]) -> float:
@@ -373,6 +518,160 @@ class BGSRegistry:
             return 0.0
         union = ((ax2 - ax1) * (ay2 - ay1)) + ((bx2 - bx1) * (by2 - by1)) - inter
         return inter / union if union > 0 else 0.0
+
+    def load_persistent_entries(self):
+        if self.persist_path is None or not self.persist_path.exists():
+            return
+
+        try:
+            with open(self.persist_path, 'rb') as file_handle:
+                payload = pickle.load(file_handle)
+        except Exception as e:
+            print(f"⚠️  Failed to load persistent person registry: {e}")
+            return
+
+        loaded_count = 0
+        next_person_id = int(payload.get('next_person_id', 1)) if isinstance(payload, dict) else 1
+        person_entries = payload.get('entries', []) if isinstance(payload, dict) else []
+        for item in person_entries:
+            try:
+                stable_id = int(item['stable_id'])
+                if stable_id < self.PERSON_BASE_ID:
+                    continue
+
+                appearance_list = item.get('appearance', [])
+                appearance = np.asarray(appearance_list, dtype=np.float32) if appearance_list else None
+                gallery_arrays = [
+                    np.asarray(feature, dtype=np.float32)
+                    for feature in item.get('appearance_gallery', [])
+                ]
+                if appearance is None and not gallery_arrays:
+                    continue
+
+                self.entries[stable_id] = {
+                    'bbox': item.get('bbox', [0.0, 0.0, 0.0, 0.0]),
+                    'class_id': self.config.PERSON_CLASS_ID,
+                    'last_frame': 0,
+                    'last_seen_ts': float(item.get('last_seen_ts', 0.0)),
+                    'bt_ids': set(item.get('bt_ids', [])),
+                    'appearance': appearance,
+                    'appearance_gallery': deque(gallery_arrays, maxlen=self.config.REID_PERSON_GALLERY_SIZE),
+                    'saved_frame_count': int(item.get('saved_frame_count', 0)),
+                    'last_logged_frame': int(item.get('last_logged_frame', -1)),
+                    'persisted_only': True,
+                }
+                loaded_count += 1
+            except Exception:
+                continue
+
+        self.next_person_id = max(self.next_person_id, next_person_id)
+        self.loaded_person_count = loaded_count
+
+    def save_persistent_entries(self):
+        if self.persist_path is None:
+            return
+
+        person_entries = []
+        for stable_id, entry in self.entries.items():
+            if entry.get('class_id') != self.config.PERSON_CLASS_ID:
+                continue
+
+            appearance = entry.get('appearance')
+            gallery = entry.get('appearance_gallery') or []
+            if appearance is None and not gallery:
+                continue
+
+            person_entries.append({
+                'stable_id': stable_id,
+                'bbox': entry.get('bbox', [0.0, 0.0, 0.0, 0.0]),
+                'last_seen_ts': float(entry.get('last_seen_ts', time.time())),
+                'bt_ids': sorted(entry.get('bt_ids', set())),
+                'appearance': appearance.tolist() if appearance is not None else [],
+                'appearance_gallery': [feature.tolist() for feature in gallery],
+                'saved_frame_count': int(entry.get('saved_frame_count', 0)),
+                'last_logged_frame': int(entry.get('last_logged_frame', -1)),
+            })
+
+        payload = {
+            'entries': person_entries,
+            'next_person_id': self.next_person_id,
+        }
+
+        try:
+            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.persist_path, 'wb') as file_handle:
+                pickle.dump(payload, file_handle)
+            self._write_person_logs(person_entries)
+        except Exception as e:
+            print(f"⚠️  Failed to save persistent person registry: {e}")
+
+    def _write_person_logs(self, person_entries: List[Dict]):
+        if self.persist_log_dir is None:
+            return
+
+        self.persist_log_dir.mkdir(parents=True, exist_ok=True)
+        for item in person_entries:
+            summary_path = self.persist_log_dir / f"person_{item['stable_id']}.json"
+            summary = {
+                'stable_id': item['stable_id'],
+                'last_seen_ts': item['last_seen_ts'],
+                'gallery_size': len(item.get('appearance_gallery', [])),
+                'bt_ids': item.get('bt_ids', []),
+                'bbox': item.get('bbox', [0.0, 0.0, 0.0, 0.0]),
+                'saved_frame_count': int(item.get('saved_frame_count', 0)),
+                'last_logged_frame': int(item.get('last_logged_frame', -1)),
+            }
+            with open(summary_path, 'w', encoding='utf-8') as file_handle:
+                json.dump(summary, file_handle, indent=2)
+
+    def log_person_frame(self, stable_id: int, frame_number: int, frame: np.ndarray,
+                         bbox: List[float], match_meta: Optional[Dict[str, float | str]] = None,
+                         bt_id: Optional[int] = None):
+        if self.persist_log_dir is None:
+            return
+
+        entry = self.entries.get(stable_id)
+        if entry is None or entry.get('class_id') != self.config.PERSON_CLASS_ID:
+            return
+        if entry.get('last_logged_frame') == frame_number:
+            return
+
+        frame_h, frame_w = frame.shape[:2]
+        x1 = max(0, min(frame_w - 1, int(bbox[0])))
+        y1 = max(0, min(frame_h - 1, int(bbox[1])))
+        x2 = max(0, min(frame_w, int(bbox[2])))
+        y2 = max(0, min(frame_h, int(bbox[3])))
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return
+
+        person_dir = self.persist_log_dir / f"person_{stable_id}"
+        frames_dir = person_dir / self.config.REID_FRAME_IMAGE_DIRNAME
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"frame_{frame_number:06d}{self.config.REID_FRAME_IMAGE_EXT}"
+        image_path = frames_dir / filename
+        if not cv2.imwrite(str(image_path), crop):
+            return
+
+        metadata_path = person_dir / self.config.REID_FRAME_METADATA_NAME
+        record = {
+            'frame_number': int(frame_number),
+            'image_path': str(image_path),
+            'bbox': [float(x1), float(y1), float(x2), float(y2)],
+            'match_reason': str((match_meta or {}).get('reason', '')),
+            'match_score': float((match_meta or {}).get('score', 0.0)),
+            'bt_id': int(bt_id) if bt_id is not None else None,
+            'timestamp': time.time(),
+        }
+        with open(metadata_path, 'a', encoding='utf-8') as file_handle:
+            file_handle.write(json.dumps(record) + "\n")
+
+        entry['saved_frame_count'] = int(entry.get('saved_frame_count', 0)) + 1
+        entry['last_logged_frame'] = frame_number
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -621,6 +920,12 @@ class Visualizer:
             color = self.config.COLOR_PERSON
             thickness = self.config.LINE_THICKNESS
             label = f"Person #{obj_id}"
+            match_reason = detection.get('match_reason')
+            match_score = detection.get('match_score')
+            if match_reason:
+                label += f" [{match_reason}]"
+            if match_reason in {'reid', 'geo'}:
+                label += f" {match_score:.2f}"
         else:
             # Bag - color based on status
             if bag_state:
@@ -851,11 +1156,21 @@ class BagGuardSystem:
         self.distance_estimator = DistanceEstimator()
         self.ownership_manager = OwnershipManager(self.distance_estimator)
         self.visualizer = Visualizer()
-        self.id_registry = BGSRegistry()
+        self.person_reid = PersonReIDEmbedder(
+            self.device,
+            self.config.REID_PERSON_MODEL_NAME,
+            self._resolve_reid_model_path(),
+        )
+        reid_registry_path, reid_log_dir = self._resolve_reid_store_paths()
+        self.id_registry = BGSRegistry(reid_registry_path, reid_log_dir)
         
         print("✓ Distance Estimator initialized")
         print("✓ Ownership Manager initialized")
         print("✓ Visualizer initialized")
+        if self.person_reid.enabled:
+            print("✓ Person re-ID initialized")
+        if self.id_registry.loaded_person_count:
+            print(f"✓ Loaded persistent person logs: {self.id_registry.loaded_person_count}")
         
         # Statistics
         self.frame_count = 0
@@ -863,6 +1178,7 @@ class BagGuardSystem:
         self.person_ids_seen = set()
         self.bag_ids_seen = set()
         self.start_time = None
+        self.logged_person_frame_count = 0
 
     def _validate_class_config(self):
         expected_ids = self.config.EXPECTED_CLASS_IDS
@@ -933,6 +1249,41 @@ class BagGuardSystem:
         print(f"✓ Tracker config loaded: {tracker_file}")
         return str(tracker_file)
 
+    def _resolve_reid_model_path(self) -> str:
+        model_value = str(self.config.REID_PERSON_MODEL_PATH).strip()
+        if not model_value:
+            return ""
+
+        root = Path(__file__).resolve().parents[1]
+        model_path = Path(model_value)
+        resolved = model_path if model_path.is_absolute() else root / model_path
+        if resolved.exists():
+            return str(resolved)
+
+        try:
+            from torchreid.reid_model_factory import get_model_url
+            import gdown
+
+            model_url = get_model_url(SimpleNamespace(name=resolved.name))
+            if model_url:
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                print(f"⚠️  Downloading person re-ID weights to: {resolved}")
+                gdown.download(model_url, str(resolved), quiet=False)
+                if resolved.exists():
+                    return str(resolved)
+        except Exception as e:
+            print(f"⚠️  Person re-ID weight download failed: {e}")
+
+        print(f"⚠️  Person re-ID weights not found: {resolved}")
+        print(f"⚠️  Falling back to built-in pretrained {self.config.REID_PERSON_MODEL_NAME}")
+        return ""
+
+    def _resolve_reid_store_paths(self) -> Tuple[Path, Path]:
+        root = Path(__file__).resolve().parents[1]
+        persist_path = root / self.config.REID_PERSIST_PATH
+        log_dir = root / self.config.REID_PERSIST_LOG_DIR
+        return persist_path, log_dir
+
     def _run_startup_inference(self):
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
@@ -976,7 +1327,7 @@ class BagGuardSystem:
             print(f"  {label}: {class_counts.get(cid, 0)}")
         print(f"  Bags total: {bag_count}")
     
-    def extract_detections(self, results) -> Tuple[List[Dict], List[Dict]]:
+    def extract_detections(self, results, frame: np.ndarray) -> Tuple[List[Dict], List[Dict]]:
         """Extract detections with 3D position estimation"""
         people = []
         bags = []
@@ -985,6 +1336,32 @@ class BagGuardSystem:
             return people, bags
         
         boxes = results[0].boxes
+        person_appearances: Dict[int, np.ndarray] = {}
+
+        if self.person_reid.enabled:
+            person_indices = []
+            person_crops = []
+            for i in range(len(boxes)):
+                cls_id = int(boxes[i].cls[0])
+                if cls_id != self.config.PERSON_CLASS_ID:
+                    continue
+
+                conf = float(boxes[i].conf[0])
+                if conf < self.config.PERSON_CONF:
+                    continue
+
+                bbox = boxes[i].xyxy[0].cpu().numpy().tolist()
+                crop = self.person_reid.crop_person(frame, bbox)
+                if crop is None:
+                    continue
+
+                person_indices.append(i)
+                person_crops.append(crop)
+
+            embeddings = self.person_reid.extract(person_crops)
+            for idx, embedding in zip(person_indices, embeddings):
+                if embedding is not None:
+                    person_appearances[idx] = embedding
         
         for i in range(len(boxes)):
             cls_id = int(boxes[i].cls[0])
@@ -1003,11 +1380,28 @@ class BagGuardSystem:
                 if conf < self.config.BAG_CONF:
                     continue
             
+            appearance = person_appearances.get(i)
+
             bt_id = int(boxes[i].id[0]) if boxes[i].id is not None else None
-            stable_id = self.id_registry.resolve(bbox, cls_id, self.frame_count, bt_id)
+            stable_id, match_meta = self.id_registry.resolve(
+                bbox,
+                cls_id,
+                self.frame_count,
+                bt_id,
+                appearance=appearance,
+            )
 
             if cls_id == 0:  # PERSON
                 position_3d = self.distance_estimator.estimate_position_3d(bbox, is_person=True)
+                self.id_registry.log_person_frame(
+                    stable_id,
+                    self.frame_count,
+                    frame,
+                    bbox,
+                    match_meta=match_meta,
+                    bt_id=bt_id,
+                )
+                self.logged_person_frame_count += 1
 
                 detection = {
                     'id': stable_id,
@@ -1017,6 +1411,8 @@ class BagGuardSystem:
                     'conf': conf,
                     'position_3d': position_3d
                 }
+                detection['match_reason'] = str(match_meta.get('reason', ''))
+                detection['match_score'] = float(match_meta.get('score', 0.0))
                 people.append(detection)
                 self.person_ids_seen.add(stable_id)
                 
@@ -1080,7 +1476,7 @@ class BagGuardSystem:
         )
 
         # Extract with 3D positions
-        people, bags = self.extract_detections(results)
+        people, bags = self.extract_detections(results, frame)
         self._refine_bag_depths(bags, people)
         
         # Update ownership
@@ -1192,6 +1588,8 @@ class BagGuardSystem:
                     cv2.imshow('BGS - Full Specification', annotated_frame)
 
                 if do_infer and self.frame_count % 30 == 0:
+                    if self.frame_count % self.config.REID_PERSIST_INTERVAL_FRAMES == 0:
+                        self.id_registry.save_persistent_entries()
                     if total_frames > 0:
                         progress = (self.frame_count / total_frames) * 100
                         prefix = f"Progress: {progress:5.1f}% | Frame: {self.frame_count:5d}/{total_frames}"
@@ -1216,6 +1614,7 @@ class BagGuardSystem:
             traceback.print_exc()
             return False
         finally:
+            self.id_registry.save_persistent_entries()
             cap.release()
             out.release()
             cv2.destroyAllWindows()
