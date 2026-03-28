@@ -143,6 +143,14 @@ class BGSConfig:
     REID_APPEARANCE_UPDATE_WEIGHT = 0.20
     REID_PERSON_GALLERY_SIZE = 12
     REID_PERSON_APPEARANCE_PRIORITY = 0.04
+    REID_BAG_APPEARANCE_MAX_AGE_FRAMES = 600
+    REID_BAG_EMBED_THRESHOLD = 0.72
+    REID_BAG_MIN_CROP_SIZE = 20
+    REID_BAG_SIZE_RATIO_MIN = 0.45
+    REID_BAG_ASPECT_RATIO_MAX_DIFF = 0.90
+    REID_BAG_GALLERY_SIZE = 8
+    REID_BAG_OWNER_MATCH_BONUS = 0.08
+    REID_BAG_APPEARANCE_PRIORITY = 0.05
     REID_PERSIST_PATH = "logs/person_reid/person_registry.pkl"
     REID_PERSIST_LOG_DIR = "logs/person_reid"
     REID_PERSIST_INTERVAL_FRAMES = 30
@@ -285,6 +293,60 @@ class PersonReIDEmbedder:
         return embeddings
 
 
+class BagReIDEmbedder:
+    """Lightweight handcrafted appearance extractor for bag re-identification."""
+
+    def __init__(self):
+        self.config = BGSConfig
+
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    def crop_bag(self, frame: np.ndarray, bbox: List[float]) -> Optional[np.ndarray]:
+        frame_h, frame_w = frame.shape[:2]
+        x1 = max(0, min(frame_w - 1, int(bbox[0])))
+        y1 = max(0, min(frame_h - 1, int(bbox[1])))
+        x2 = max(0, min(frame_w, int(bbox[2])))
+        y2 = max(0, min(frame_h, int(bbox[3])))
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+
+        crop_h, crop_w = crop.shape[:2]
+        if crop_h < self.config.REID_BAG_MIN_CROP_SIZE or crop_w < self.config.REID_BAG_MIN_CROP_SIZE:
+            return None
+
+        return crop
+
+    def extract_one(self, crop: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if crop is None or crop.size == 0:
+            return None
+
+        resized = cv2.resize(crop, (64, 64), interpolation=cv2.INTER_LINEAR)
+        hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
+        hsv_hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256]).flatten()
+        gray_hist = cv2.calcHist([gray], [0], None, [16], [0, 256]).flatten()
+        edges = cv2.Canny(gray, 80, 160)
+        edge_density = np.asarray([float(np.count_nonzero(edges)) / float(edges.size)], dtype=np.float32)
+        aspect_ratio = np.asarray([float(crop.shape[1]) / max(1.0, float(crop.shape[0]))], dtype=np.float32)
+
+        vector = np.concatenate([
+            hsv_hist.astype(np.float32),
+            gray_hist.astype(np.float32),
+            edge_density,
+            aspect_ratio,
+        ])
+        norm = float(np.linalg.norm(vector))
+        return vector / norm if norm > 0 else None
+
+
 class BGSRegistry:
     """Stable-ID registry for person and bag tracks."""
 
@@ -300,11 +362,13 @@ class BGSRegistry:
         self.persist_path = Path(persist_path) if persist_path is not None else None
         self.persist_log_dir = Path(persist_log_dir) if persist_log_dir is not None else None
         self.loaded_person_count = 0
+        self.loaded_bag_count = 0
         self.load_persistent_entries()
 
     def resolve(self, bbox: List[float], class_id: int, frame_number: int,
                 bt_id: Optional[int] = None,
-                appearance: Optional[np.ndarray] = None) -> Tuple[int, Dict[str, float | str]]:
+                appearance: Optional[np.ndarray] = None,
+                owner_hint: Optional[int] = None) -> Tuple[int, Dict[str, float | str]]:
         self._expire(frame_number)
         used_ids = self.used_ids_by_frame.setdefault(frame_number, set())
         centroid_thresh = (
@@ -342,6 +406,28 @@ class BGSRegistry:
                 used_ids.add(appearance_id)
                 return appearance_id, {'reason': 'reid', 'score': appearance_score}
 
+        if class_id in self.config.BAG_CLASS_IDS and appearance is not None:
+            appearance_id, appearance_score = self._match_bag_by_appearance(
+                bbox, class_id, appearance, frame_number, used_ids, owner_hint
+            )
+            if appearance_id is not None:
+                geometry_id, geometry_meta = self._match_by_geometry(
+                    bbox, class_id, frame_number, used_ids, centroid_thresh
+                )
+                if geometry_id is not None and geometry_id != appearance_id:
+                    geometry_iou = float(geometry_meta.get('iou', 0.0))
+                    appearance_margin = appearance_score - self.config.REID_BAG_EMBED_THRESHOLD
+                    if geometry_iou >= self.config.REID_IOU_THRESH and appearance_margin < self.config.REID_BAG_APPEARANCE_PRIORITY:
+                        self._update(geometry_id, bbox, frame_number, bt_id, appearance)
+                        used_ids.add(geometry_id)
+                        return geometry_id, geometry_meta
+
+                self._update(appearance_id, bbox, frame_number, bt_id, appearance)
+                if owner_hint is not None:
+                    self.entries[appearance_id]['owner_id'] = owner_hint
+                used_ids.add(appearance_id)
+                return appearance_id, {'reason': 'bag-reid', 'score': appearance_score}
+
         best_id, geometry_meta = self._match_by_geometry(
             bbox, class_id, frame_number, used_ids, centroid_thresh
         )
@@ -360,8 +446,9 @@ class BGSRegistry:
             'appearance': appearance.copy() if appearance is not None else None,
             'appearance_gallery': deque(
                 [appearance.copy()] if appearance is not None else [],
-                maxlen=self.config.REID_PERSON_GALLERY_SIZE,
+                maxlen=self._gallery_size(class_id),
             ),
+            'owner_id': owner_hint if class_id in self.config.BAG_CLASS_IDS else None,
             'persisted_only': False,
         }
         used_ids.add(new_id)
@@ -387,14 +474,19 @@ class BGSRegistry:
                 entry['appearance'] = blended / norm if norm > 0 else appearance.copy()
             gallery = entry.setdefault(
                 'appearance_gallery',
-                deque(maxlen=self.config.REID_PERSON_GALLERY_SIZE)
+                deque(maxlen=self._gallery_size(entry['class_id']))
             )
             gallery.append(appearance.copy())
 
     def _expire(self, frame_number: int):
+        now = time.time()
         self.entries = {
             key: value for key, value in self.entries.items()
-            if value.get('class_id') == self.config.PERSON_CLASS_ID
+            if (
+                value.get('persisted_only')
+                and now - float(value.get('last_seen_ts', 0.0)) <= self.config.REID_PERSIST_MAX_AGE_SECONDS
+            )
+            or value.get('class_id') == self.config.PERSON_CLASS_ID
             or frame_number - value['last_frame'] <= self.config.REID_MAX_AGE_FRAMES
         }
         self.used_ids_by_frame = {
@@ -415,6 +507,11 @@ class BGSRegistry:
     @staticmethod
     def _centroid(bbox: List[float]) -> Tuple[float, float]:
         return (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+
+    def _gallery_size(self, class_id: int) -> int:
+        if class_id == self.config.PERSON_CLASS_ID:
+            return self.config.REID_PERSON_GALLERY_SIZE
+        return self.config.REID_BAG_GALLERY_SIZE
 
     def _match_by_geometry(self, bbox: List[float], class_id: int, frame_number: int,
                            used_ids: set, centroid_thresh: float) -> Tuple[Optional[int], Optional[Dict[str, float | str]]]:
@@ -492,6 +589,49 @@ class BGSRegistry:
 
         return best_id, best_similarity
 
+    def _match_bag_by_appearance(self, bbox: List[float], class_id: int, appearance: np.ndarray,
+                                 frame_number: int, used_ids: set,
+                                 owner_hint: Optional[int]) -> Tuple[Optional[int], float]:
+        best_id = None
+        best_similarity = self.config.REID_BAG_EMBED_THRESHOLD
+
+        for stable_id, entry in self.entries.items():
+            if entry['class_id'] != class_id or stable_id in used_ids:
+                continue
+
+            if entry.get('persisted_only'):
+                last_seen_ts = float(entry.get('last_seen_ts', 0.0))
+                if last_seen_ts <= 0:
+                    continue
+                if time.time() - last_seen_ts > self.config.REID_PERSIST_MAX_AGE_SECONDS:
+                    continue
+            else:
+                age = frame_number - entry['last_frame']
+                if age < 0 or age > self.config.REID_BAG_APPEARANCE_MAX_AGE_FRAMES:
+                    continue
+
+            stored_appearance = entry.get('appearance')
+            gallery = entry.get('appearance_gallery') or []
+            if stored_appearance is None and not gallery:
+                continue
+
+            if not self._bag_size_compatible(bbox, entry['bbox']):
+                continue
+
+            similarities = [float(np.dot(appearance, gallery_feature)) for gallery_feature in gallery]
+            if stored_appearance is not None:
+                similarities.append(float(np.dot(appearance, stored_appearance)))
+            similarity = max(similarities) if similarities else -1.0
+
+            if owner_hint is not None and entry.get('owner_id') == owner_hint:
+                similarity += self.config.REID_BAG_OWNER_MATCH_BONUS
+
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_id = stable_id
+
+        return best_id, best_similarity
+
     def _appearance_size_compatible(self, bbox_a: List[float], bbox_b: List[float]) -> bool:
         height_a = max(1.0, bbox_a[3] - bbox_a[1])
         height_b = max(1.0, bbox_b[3] - bbox_b[1])
@@ -504,6 +644,25 @@ class BGSRegistry:
         aspect_a = width_a / height_a
         aspect_b = width_b / height_b
         return abs(aspect_a - aspect_b) <= self.config.REID_PERSON_ASPECT_RATIO_MAX_DIFF
+
+    def _bag_size_compatible(self, bbox_a: List[float], bbox_b: List[float]) -> bool:
+        height_a = max(1.0, bbox_a[3] - bbox_a[1])
+        height_b = max(1.0, bbox_b[3] - bbox_b[1])
+        size_ratio = min(height_a, height_b) / max(height_a, height_b)
+        if size_ratio < self.config.REID_BAG_SIZE_RATIO_MIN:
+            return False
+
+        width_a = max(1.0, bbox_a[2] - bbox_a[0])
+        width_b = max(1.0, bbox_b[2] - bbox_b[0])
+        aspect_a = width_a / height_a
+        aspect_b = width_b / height_b
+        return abs(aspect_a - aspect_b) <= self.config.REID_BAG_ASPECT_RATIO_MAX_DIFF
+
+    def update_bag_owner(self, bag_id: int, owner_id: Optional[int]):
+        entry = self.entries.get(bag_id)
+        if entry is None or entry.get('class_id') not in self.config.BAG_CLASS_IDS:
+            return
+        entry['owner_id'] = owner_id
 
     @staticmethod
     def _iou(bbox_a: List[float], bbox_b: List[float]) -> float:
@@ -530,12 +689,15 @@ class BGSRegistry:
             print(f"⚠️  Failed to load persistent person registry: {e}")
             return
 
-        loaded_count = 0
+        loaded_person_count = 0
+        loaded_bag_count = 0
         next_person_id = int(payload.get('next_person_id', 1)) if isinstance(payload, dict) else 1
-        person_entries = payload.get('entries', []) if isinstance(payload, dict) else []
-        for item in person_entries:
+        next_bag_id = int(payload.get('next_bag_id', 1)) if isinstance(payload, dict) else 1
+        entries = payload.get('entries', []) if isinstance(payload, dict) else []
+        for item in entries:
             try:
                 stable_id = int(item['stable_id'])
+                class_id = int(item.get('class_id', self.config.PERSON_CLASS_ID))
                 if stable_id < self.PERSON_BASE_ID:
                     continue
 
@@ -550,39 +712,43 @@ class BGSRegistry:
 
                 self.entries[stable_id] = {
                     'bbox': item.get('bbox', [0.0, 0.0, 0.0, 0.0]),
-                    'class_id': self.config.PERSON_CLASS_ID,
+                    'class_id': class_id,
                     'last_frame': 0,
                     'last_seen_ts': float(item.get('last_seen_ts', 0.0)),
                     'bt_ids': set(item.get('bt_ids', [])),
                     'appearance': appearance,
-                    'appearance_gallery': deque(gallery_arrays, maxlen=self.config.REID_PERSON_GALLERY_SIZE),
+                    'appearance_gallery': deque(gallery_arrays, maxlen=self._gallery_size(class_id)),
                     'saved_frame_count': int(item.get('saved_frame_count', 0)),
                     'last_logged_frame': int(item.get('last_logged_frame', -1)),
+                    'owner_id': item.get('owner_id'),
                     'persisted_only': True,
                 }
-                loaded_count += 1
+                if class_id == self.config.PERSON_CLASS_ID:
+                    loaded_person_count += 1
+                elif class_id in self.config.BAG_CLASS_IDS:
+                    loaded_bag_count += 1
             except Exception:
                 continue
 
         self.next_person_id = max(self.next_person_id, next_person_id)
-        self.loaded_person_count = loaded_count
+        self.next_bag_id = max(self.next_bag_id, next_bag_id)
+        self.loaded_person_count = loaded_person_count
+        self.loaded_bag_count = loaded_bag_count
 
     def save_persistent_entries(self):
         if self.persist_path is None:
             return
 
-        person_entries = []
+        persisted_entries = []
         for stable_id, entry in self.entries.items():
-            if entry.get('class_id') != self.config.PERSON_CLASS_ID:
-                continue
-
             appearance = entry.get('appearance')
             gallery = entry.get('appearance_gallery') or []
             if appearance is None and not gallery:
                 continue
 
-            person_entries.append({
+            persisted_entries.append({
                 'stable_id': stable_id,
+                'class_id': int(entry.get('class_id', self.config.PERSON_CLASS_ID)),
                 'bbox': entry.get('bbox', [0.0, 0.0, 0.0, 0.0]),
                 'last_seen_ts': float(entry.get('last_seen_ts', time.time())),
                 'bt_ids': sorted(entry.get('bt_ids', set())),
@@ -590,48 +756,90 @@ class BGSRegistry:
                 'appearance_gallery': [feature.tolist() for feature in gallery],
                 'saved_frame_count': int(entry.get('saved_frame_count', 0)),
                 'last_logged_frame': int(entry.get('last_logged_frame', -1)),
+                'owner_id': entry.get('owner_id'),
             })
 
         payload = {
-            'entries': person_entries,
+            'entries': persisted_entries,
             'next_person_id': self.next_person_id,
+            'next_bag_id': self.next_bag_id,
         }
 
         try:
             self.persist_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.persist_path, 'wb') as file_handle:
                 pickle.dump(payload, file_handle)
-            self._write_person_logs(person_entries)
+            self._write_entry_logs(persisted_entries)
         except Exception as e:
             print(f"⚠️  Failed to save persistent person registry: {e}")
 
-    def _write_person_logs(self, person_entries: List[Dict]):
+    def _write_entry_logs(self, persisted_entries: List[Dict]):
         if self.persist_log_dir is None:
             return
 
         self.persist_log_dir.mkdir(parents=True, exist_ok=True)
-        for item in person_entries:
-            summary_path = self.persist_log_dir / f"person_{item['stable_id']}.json"
+        for item in persisted_entries:
+            class_id = int(item.get('class_id', self.config.PERSON_CLASS_ID))
+            prefix = self._entry_prefix(class_id)
+            summary_path = self.persist_log_dir / f"{prefix}_{item['stable_id']}.json"
             summary = {
                 'stable_id': item['stable_id'],
+                'class_id': class_id,
                 'last_seen_ts': item['last_seen_ts'],
                 'gallery_size': len(item.get('appearance_gallery', [])),
                 'bt_ids': item.get('bt_ids', []),
                 'bbox': item.get('bbox', [0.0, 0.0, 0.0, 0.0]),
                 'saved_frame_count': int(item.get('saved_frame_count', 0)),
                 'last_logged_frame': int(item.get('last_logged_frame', -1)),
+                'owner_id': item.get('owner_id'),
             }
             with open(summary_path, 'w', encoding='utf-8') as file_handle:
                 json.dump(summary, file_handle, indent=2)
 
+    def _entry_prefix(self, class_id: int) -> str:
+        if class_id == self.config.PERSON_CLASS_ID:
+            return 'person'
+        return 'bag'
+
     def log_person_frame(self, stable_id: int, frame_number: int, frame: np.ndarray,
                          bbox: List[float], match_meta: Optional[Dict[str, float | str]] = None,
                          bt_id: Optional[int] = None):
+        self._log_entity_frame(
+            stable_id,
+            self.config.PERSON_CLASS_ID,
+            frame_number,
+            frame,
+            bbox,
+            match_meta,
+            bt_id,
+        )
+
+    def log_bag_frame(self, stable_id: int, frame_number: int, frame: np.ndarray,
+                      bbox: List[float], match_meta: Optional[Dict[str, float | str]] = None,
+                      bt_id: Optional[int] = None):
+        self._log_entity_frame(
+            stable_id,
+            None,
+            frame_number,
+            frame,
+            bbox,
+            match_meta,
+            bt_id,
+        )
+
+    def _log_entity_frame(self, stable_id: int, expected_class_id: Optional[int],
+                          frame_number: int, frame: np.ndarray, bbox: List[float],
+                          match_meta: Optional[Dict[str, float | str]] = None,
+                          bt_id: Optional[int] = None):
         if self.persist_log_dir is None:
             return
 
         entry = self.entries.get(stable_id)
-        if entry is None or entry.get('class_id') != self.config.PERSON_CLASS_ID:
+        if entry is None:
+            return
+        if expected_class_id is not None and entry.get('class_id') != expected_class_id:
+            return
+        if expected_class_id is None and entry.get('class_id') not in self.config.BAG_CLASS_IDS:
             return
         if entry.get('last_logged_frame') == frame_number:
             return
@@ -648,8 +856,9 @@ class BGSRegistry:
         if crop.size == 0:
             return
 
-        person_dir = self.persist_log_dir / f"person_{stable_id}"
-        frames_dir = person_dir / self.config.REID_FRAME_IMAGE_DIRNAME
+        prefix = self._entry_prefix(int(entry.get('class_id', self.config.PERSON_CLASS_ID)))
+        entity_dir = self.persist_log_dir / f"{prefix}_{stable_id}"
+        frames_dir = entity_dir / self.config.REID_FRAME_IMAGE_DIRNAME
         frames_dir.mkdir(parents=True, exist_ok=True)
 
         filename = f"frame_{frame_number:06d}{self.config.REID_FRAME_IMAGE_EXT}"
@@ -657,14 +866,16 @@ class BGSRegistry:
         if not cv2.imwrite(str(image_path), crop):
             return
 
-        metadata_path = person_dir / self.config.REID_FRAME_METADATA_NAME
+        metadata_path = entity_dir / self.config.REID_FRAME_METADATA_NAME
         record = {
             'frame_number': int(frame_number),
             'image_path': str(image_path),
+            'class_id': int(entry.get('class_id', self.config.PERSON_CLASS_ID)),
             'bbox': [float(x1), float(y1), float(x2), float(y2)],
             'match_reason': str((match_meta or {}).get('reason', '')),
             'match_score': float((match_meta or {}).get('score', 0.0)),
             'bt_id': int(bt_id) if bt_id is not None else None,
+            'owner_id': entry.get('owner_id'),
             'timestamp': time.time(),
         }
         with open(metadata_path, 'a', encoding='utf-8') as file_handle:
@@ -1161,6 +1372,7 @@ class BagGuardSystem:
             self.config.REID_PERSON_MODEL_NAME,
             self._resolve_reid_model_path(),
         )
+        self.bag_reid = BagReIDEmbedder()
         reid_registry_path, reid_log_dir = self._resolve_reid_store_paths()
         self.id_registry = BGSRegistry(reid_registry_path, reid_log_dir)
         
@@ -1169,8 +1381,12 @@ class BagGuardSystem:
         print("✓ Visualizer initialized")
         if self.person_reid.enabled:
             print("✓ Person re-ID initialized")
+        if self.bag_reid.enabled:
+            print("✓ Bag re-ID initialized")
         if self.id_registry.loaded_person_count:
             print(f"✓ Loaded persistent person logs: {self.id_registry.loaded_person_count}")
+        if self.id_registry.loaded_bag_count:
+            print(f"✓ Loaded persistent bag logs: {self.id_registry.loaded_bag_count}")
         
         # Statistics
         self.frame_count = 0
@@ -1179,6 +1395,7 @@ class BagGuardSystem:
         self.bag_ids_seen = set()
         self.start_time = None
         self.logged_person_frame_count = 0
+        self.logged_bag_frame_count = 0
 
     def _validate_class_config(self):
         expected_ids = self.config.EXPECTED_CLASS_IDS
@@ -1337,6 +1554,7 @@ class BagGuardSystem:
         
         boxes = results[0].boxes
         person_appearances: Dict[int, np.ndarray] = {}
+        bag_appearances: Dict[int, np.ndarray] = {}
 
         if self.person_reid.enabled:
             person_indices = []
@@ -1362,6 +1580,68 @@ class BagGuardSystem:
             for idx, embedding in zip(person_indices, embeddings):
                 if embedding is not None:
                     person_appearances[idx] = embedding
+
+        if self.bag_reid.enabled:
+            for i in range(len(boxes)):
+                cls_id = int(boxes[i].cls[0])
+                if cls_id not in self.config.BAG_CLASS_IDS:
+                    continue
+
+                conf = float(boxes[i].conf[0])
+                if conf < self.config.BAG_CONF:
+                    continue
+
+                bbox = boxes[i].xyxy[0].cpu().numpy().tolist()
+                crop = self.bag_reid.crop_bag(frame, bbox)
+                embedding = self.bag_reid.extract_one(crop)
+                if embedding is not None:
+                    bag_appearances[i] = embedding
+
+        for i in range(len(boxes)):
+            cls_id = int(boxes[i].cls[0])
+
+            if cls_id != self.config.PERSON_CLASS_ID:
+                continue
+
+            bbox = boxes[i].xyxy[0].cpu().numpy().tolist()
+            conf = float(boxes[i].conf[0])
+            class_name = self.config.TARGET_CLASSES[cls_id]
+            if conf < self.config.PERSON_CONF:
+                continue
+
+            appearance = person_appearances.get(i)
+            bt_id = int(boxes[i].id[0]) if boxes[i].id is not None else None
+            stable_id, match_meta = self.id_registry.resolve(
+                bbox,
+                cls_id,
+                self.frame_count,
+                bt_id,
+                appearance=appearance,
+            )
+
+            position_3d = self.distance_estimator.estimate_position_3d(bbox, is_person=True)
+            self.id_registry.log_person_frame(
+                stable_id,
+                self.frame_count,
+                frame,
+                bbox,
+                match_meta=match_meta,
+                bt_id=bt_id,
+            )
+            self.logged_person_frame_count += 1
+
+            detection = {
+                'id': stable_id,
+                'class': class_name,
+                'class_id': cls_id,
+                'bbox': bbox,
+                'conf': conf,
+                'position_3d': position_3d
+            }
+            detection['match_reason'] = str(match_meta.get('reason', ''))
+            detection['match_score'] = float(match_meta.get('score', 0.0))
+            people.append(detection)
+            self.person_ids_seen.add(stable_id)
         
         for i in range(len(boxes)):
             cls_id = int(boxes[i].cls[0])
@@ -1380,7 +1660,11 @@ class BagGuardSystem:
                 if conf < self.config.BAG_CONF:
                     continue
             
-            appearance = person_appearances.get(i)
+            if cls_id == self.config.PERSON_CLASS_ID:
+                continue
+
+            appearance = bag_appearances.get(i)
+            owner_hint = self._estimate_bag_owner_hint(bbox, people)
 
             bt_id = int(boxes[i].id[0]) if boxes[i].id is not None else None
             stable_id, match_meta = self.id_registry.resolve(
@@ -1389,48 +1673,55 @@ class BagGuardSystem:
                 self.frame_count,
                 bt_id,
                 appearance=appearance,
+                owner_hint=owner_hint,
             )
 
-            if cls_id == 0:  # PERSON
-                position_3d = self.distance_estimator.estimate_position_3d(bbox, is_person=True)
-                self.id_registry.log_person_frame(
-                    stable_id,
-                    self.frame_count,
-                    frame,
-                    bbox,
-                    match_meta=match_meta,
-                    bt_id=bt_id,
-                )
-                self.logged_person_frame_count += 1
+            position_3d = self.distance_estimator.estimate_position_3d(bbox, is_person=False)
 
-                detection = {
-                    'id': stable_id,
-                    'class': class_name,
-                    'class_id': cls_id,
-                    'bbox': bbox,
-                    'conf': conf,
-                    'position_3d': position_3d
-                }
-                detection['match_reason'] = str(match_meta.get('reason', ''))
-                detection['match_score'] = float(match_meta.get('score', 0.0))
-                people.append(detection)
-                self.person_ids_seen.add(stable_id)
-                
-            else:  # BAGS
-                position_3d = self.distance_estimator.estimate_position_3d(bbox, is_person=False)
-                
-                detection = {
-                    'id': stable_id,
-                    'class': class_name,
-                    'class_id': cls_id,
-                    'bbox': bbox,
-                    'conf': conf,
-                    'position_3d': position_3d
-                }
-                bags.append(detection)
-                self.bag_ids_seen.add(stable_id)
+            detection = {
+                'id': stable_id,
+                'class': class_name,
+                'class_id': cls_id,
+                'bbox': bbox,
+                'conf': conf,
+                'position_3d': position_3d
+            }
+            detection['match_reason'] = str(match_meta.get('reason', ''))
+            detection['match_score'] = float(match_meta.get('score', 0.0))
+            detection['owner_hint'] = owner_hint
+            self.id_registry.log_bag_frame(
+                stable_id,
+                self.frame_count,
+                frame,
+                bbox,
+                match_meta=match_meta,
+                bt_id=bt_id,
+            )
+            self.logged_bag_frame_count += 1
+            bags.append(detection)
+            self.bag_ids_seen.add(stable_id)
         
         return people, bags
+
+    def _estimate_bag_owner_hint(self, bag_bbox: List[float], people: List[Dict]) -> Optional[int]:
+        if not people:
+            return None
+
+        bx = (bag_bbox[0] + bag_bbox[2]) / 2
+        by = (bag_bbox[1] + bag_bbox[3]) / 2
+        best_person_id = None
+        best_dist = float(self.config.BAG_MATCH_THRESHOLD_PX)
+
+        for person in people:
+            px1, py1, px2, py2 = person['bbox']
+            px = (px1 + px2) / 2
+            py = (py1 + py2) / 2
+            dist = float(np.hypot(bx - px, by - py))
+            if dist < best_dist:
+                best_dist = dist
+                best_person_id = int(person['id'])
+
+        return best_person_id
 
     def _refine_bag_depths(self, bags: List[Dict], people: List[Dict]):
         if not people:
@@ -1481,6 +1772,8 @@ class BagGuardSystem:
         
         # Update ownership
         bag_states = self.ownership_manager.update_ownership(bags, people, current_time)
+        for bag_id, bag_state in bag_states.items():
+            self.id_registry.update_bag_owner(bag_id, bag_state.owner_id)
         
         # Count statuses
         status_counts = {'OK': 0, 'POTENTIAL': 0, 'UNATTENDED': 0}
