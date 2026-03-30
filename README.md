@@ -1,39 +1,103 @@
-# BagGuard System (BGS)
-**Final Year Project – Computer Science**
+# Bag Guard System (BGS)
 
-## 📌 Project Overview
-The BagGuard System (BGS) is an AI-based computer vision system designed to detect and monitor unattended baggage in public spaces such as airports. The system aims to improve public safety by identifying luggage items, associating them with nearby individuals, and triggering alerts when bags are left unattended for a defined period.
+Final project implementation for unattended bag monitoring using object detection, tracking, re-identification, and ownership logic.
 
-This project is developed as part of a Final Year Project (FYP) and focuses on real-time detection, tracking, and risk assessment using deep learning techniques.
+## Overview
 
----
+This repository contains the maintained Bag Guard System codebase. The system detects people and supported bag classes, tracks them across frames, re-identifies them when tracking becomes unstable, estimates owner proximity, and raises unattended-bag states over time.
 
-## 🎯 Objectives
-- Detect baggage items (e.g. backpacks, suitcases) using YOLO
-- Detect and track people in real time
-- Associate bags with their owners based on distance and time
-- Identify unattended baggage scenarios
-- Provide visual alerts for potential security risks
+## Core Capabilities
 
----
+- YOLO-based person and bag detection
+- ByteTrack-based multi-object tracking
+- person re-identification with OSNet and `torchreid`
+- bag re-identification with handcrafted appearance embeddings
+- ownership assignment using distance and temporal persistence rules
+- unattended-bag state classification with `OK`, `POTENTIAL`, and `UNATTENDED`
+- persistent logging of person and bag identities across runs
+- modular architecture with separate components for CLI, system flow, re-ID, ownership, distance estimation, and visualization
 
-## 🧠 Technologies Used
-- **Python**
-- **YOLO (Ultralytics)**
-- **OpenCV**
-- **NumPy**
-- **VS Code**
-- **Git & GitHub**
+## Project Structure
 
----
+- `src/main.py` - thin entrypoint
+- `src/bgs/cli.py` - command-line parsing and path resolution
+- `src/bgs/system.py` - main runtime orchestration and frame pipeline
+- `src/bgs/reid.py` - person and bag re-identification plus persistence
+- `src/bgs/ownership.py` - owner assignment and unattended-state logic
+- `src/bgs/distance.py` - monocular distance and 3D position estimation
+- `src/bgs/visualization.py` - drawing and debug overlay logic
+- `models/` - canonical model weight directory
+- `models/reid/` - re-identification weights
+- `data/` - sample test videos
+- `trackers/` - tracker configuration presets
+- `outputs/` - generated output videos
+- `logs/` - persistent re-identification data and frame logs
 
-## ⚙️ System Features
-- Real-time object detection
-- Distance-based bag–owner association
-- Time-based unattended bag detection
-- Visual bounding boxes and alerts
-- Video input support
+## Requirements
 
----
+- Python 3.11
+- dependencies installed from the workspace root with `pip install -r requirements.txt`
 
-## 📂 Project Structure
+## Runtime Assets
+
+- detector model: `models/yolo26x.pt`
+- person re-ID model: `models/reid/osnet_x1_0_msmt17.pt`
+- main tracker preset: `trackers/bytetrack_bgs.yaml`
+- stable tracker preset: `trackers/bytetrack_bgs_stable.yaml`
+
+## Running
+
+From this project directory:
+
+```bat
+python .\src\main.py --source 0 --show
+```
+
+Run on a sample video:
+
+```bat
+python .\src\main.py --source .\data\uni.mp4 --tracker-profile stable
+```
+
+Show CLI options:
+
+```bat
+python .\src\main.py --help
+```
+
+## CLI Options
+
+- `--source` webcam index or video path
+- `--model` detector model path, defaulting to `models/yolo26x.pt`
+- `--out` output video path
+- `--show` display live preview
+- `--imgsz` inference image size
+- `--max_fps` processing FPS cap
+- `--skip` process every `skip + 1` frame
+- `--half` enable FP16 when CUDA is available
+- `--tracker-profile` choose `main` or `stable`
+
+## Outputs
+
+- processed video output defaults to `outputs/detection_output.mp4`
+- person persistence is stored in `logs/person_reid/`
+- bag persistence is stored in `logs/bag_reid/`
+
+## Design Notes
+
+- the maintained project no longer depends on the archived `V5` prototype folder
+- final detector and re-ID weights are centralized under `models/`
+- `src/main.py` is intentionally small and delegates to the `bgs` package
+- the codebase has been refactored to reduce duplication and keep major responsibilities separated
+
+## Known Limitations
+
+- low effective FPS can increase ID switches because fewer reliable updates reach the tracker and re-ID logic
+- identity recovery still depends on crop quality, so blur, occlusion, and missed detections reduce reliability
+- ownership association is proximity-based and can be confused by dense crowds or nearby people
+- monocular distance estimation is approximate and depends on assumed object dimensions rather than camera calibration
+- several thresholds are tuned for this project setup and may need adjustment for different cameras or scenes
+
+## Status
+
+This folder is the canonical final implementation. Archived prototypes and legacy assets have been moved to the workspace-level `experiments/` directory.

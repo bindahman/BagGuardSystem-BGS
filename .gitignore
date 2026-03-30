@@ -1,5 +1,12 @@
-*.mp4
-
-# Ignore output videos
+# Generated outputs and logs
 outputs/
+logs/
+runs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Video artifacts
 *.mp4
