@@ -9,9 +9,9 @@ This repository contains the maintained Bag Guard System codebase. The system de
 ## Core Capabilities
 
 - YOLO-based person and bag detection
-- ByteTrack-based multi-object tracking
+- DeepSORT-based multi-object tracking with ByteTrack still available as a fallback backend
 - person re-identification with OSNet and `torchreid`
-- bag re-identification with handcrafted appearance embeddings
+- bag re-identification with learned appearance embeddings plus persistent cosine-similarity matching
 - ownership assignment using distance and temporal persistence rules
 - unattended-bag state classification with `OK`, `POTENTIAL`, and `UNATTENDED`
 - persistent logging of person and bag identities across runs
@@ -42,8 +42,8 @@ This repository contains the maintained Bag Guard System codebase. The system de
 
 - detector model: `models/yolo26x.pt`
 - person re-ID model: `models/reid/osnet_x1_0_msmt17.pt`
-- main tracker preset: `trackers/bytetrack_bgs.yaml`
-- stable tracker preset: `trackers/bytetrack_bgs_stable.yaml`
+- ByteTrack main preset: `trackers/bytetrack_bgs.yaml`
+- ByteTrack stable preset: `trackers/bytetrack_bgs_stable.yaml`
 
 ## Running
 
@@ -57,6 +57,12 @@ Run on a sample video:
 
 ```bat
 python .\src\main.py --source .\data\uni.mp4 --tracker-profile stable
+```
+
+Run with ByteTrack explicitly:
+
+```bat
+python .\src\main.py --source .\data\uni.mp4 --tracker-backend bytetrack --tracker-profile stable
 ```
 
 Show CLI options:
@@ -75,7 +81,8 @@ python .\src\main.py --help
 - `--max_fps` processing FPS cap
 - `--skip` process every `skip + 1` frame
 - `--half` enable FP16 when CUDA is available
-- `--tracker-profile` choose `main` or `stable`
+- `--tracker-backend` choose `deepsort` or `bytetrack`
+- `--tracker-profile` choose `main` or `stable` when using ByteTrack
 
 ## Outputs
 

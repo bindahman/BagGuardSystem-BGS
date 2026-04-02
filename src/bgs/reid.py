@@ -83,8 +83,23 @@ class PersonReIDEmbedder:
 
 
 class BagReIDEmbedder:
-    def __init__(self):
+    def __init__(self, device: str):
         self.config = BGSConfig
+        self.device = "cuda" if str(device).startswith("cuda") else "cpu"
+        self.extractor = None
+        self._fallback_notice_shown = False
+
+        try:
+            from deep_sort_realtime.embedder.embedder_pytorch import MobileNetv2_Embedder
+
+            self.extractor = MobileNetv2_Embedder(
+                half=self.device == "cuda",
+                bgr=True,
+                gpu=self.device == "cuda",
+            )
+            print("✓ Bag re-ID extractor loaded: DeepSORT MobileNetV2")
+        except Exception as e:
+            print(f"⚠️  Bag re-ID model unavailable, using fallback appearance features: {e}")
 
     @property
     def enabled(self) -> bool:
@@ -92,10 +107,15 @@ class BagReIDEmbedder:
 
     def crop_bag(self, frame: np.ndarray, bbox: List[float]) -> Optional[np.ndarray]:
         frame_h, frame_w = frame.shape[:2]
-        x1 = max(0, min(frame_w - 1, int(bbox[0])))
-        y1 = max(0, min(frame_h - 1, int(bbox[1])))
-        x2 = max(0, min(frame_w, int(bbox[2])))
-        y2 = max(0, min(frame_h, int(bbox[3])))
+        width = max(1.0, float(bbox[2] - bbox[0]))
+        height = max(1.0, float(bbox[3] - bbox[1]))
+        pad_x = int(width * 0.06)
+        pad_y = int(height * 0.06)
+
+        x1 = max(0, min(frame_w - 1, int(bbox[0]) - pad_x))
+        y1 = max(0, min(frame_h - 1, int(bbox[1]) - pad_y))
+        x2 = max(0, min(frame_w, int(bbox[2]) + pad_x))
+        y2 = max(0, min(frame_h, int(bbox[3]) + pad_y))
 
         if x2 <= x1 or y2 <= y1:
             return None
@@ -110,7 +130,32 @@ class BagReIDEmbedder:
 
         return crop
 
+    def extract(self, crops: List[np.ndarray]) -> List[Optional[np.ndarray]]:
+        if not crops:
+            return []
+
+        if self.extractor is not None:
+            try:
+                features = self.extractor.predict(crops)
+                embeddings = []
+                for feature in features:
+                    vector = np.asarray(feature, dtype=np.float32)
+                    norm = float(np.linalg.norm(vector))
+                    embeddings.append(vector / norm if norm > 0 else None)
+                return embeddings
+            except Exception as e:
+                if not self._fallback_notice_shown:
+                    print(f"⚠️  Bag re-ID model inference failed, using fallback appearance features: {e}")
+                    self._fallback_notice_shown = True
+
+        return [self._extract_fallback(crop) for crop in crops]
+
     def extract_one(self, crop: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if crop is None or crop.size == 0:
+            return None
+        return self.extract([crop])[0]
+
+    def _extract_fallback(self, crop: Optional[np.ndarray]) -> Optional[np.ndarray]:
         if crop is None or crop.size == 0:
             return None
 
@@ -171,10 +216,20 @@ class BGSRegistry:
         return last_seen_ts > 0 and time.time() - last_seen_ts <= self.config.REID_PERSIST_MAX_AGE_SECONDS
 
     @staticmethod
-    def _max_similarity(appearance: np.ndarray, entry: Dict) -> float:
-        similarities = [float(np.dot(appearance, gallery_feature)) for gallery_feature in (entry.get('appearance_gallery') or [])]
+    def _same_feature_shape(feature_a: Optional[np.ndarray], feature_b: Optional[np.ndarray]) -> bool:
+        if feature_a is None or feature_b is None:
+            return False
+        return np.asarray(feature_a).shape == np.asarray(feature_b).shape
+
+    @classmethod
+    def _max_similarity(cls, appearance: np.ndarray, entry: Dict) -> float:
+        similarities = [
+            float(np.dot(appearance, gallery_feature))
+            for gallery_feature in (entry.get('appearance_gallery') or [])
+            if cls._same_feature_shape(appearance, gallery_feature)
+        ]
         stored_appearance = entry.get('appearance')
-        if stored_appearance is not None:
+        if cls._same_feature_shape(appearance, stored_appearance):
             similarities.append(float(np.dot(appearance, stored_appearance)))
         return max(similarities) if similarities else -1.0
 
@@ -440,14 +495,25 @@ class BGSRegistry:
             entry['bt_ids'].add(bt_id)
         if appearance is not None:
             existing = entry.get('appearance')
-            if existing is None:
+            gallery_size = self._gallery_size(entry['class_id'])
+            if existing is None or not self._same_feature_shape(appearance, existing):
                 entry['appearance'] = appearance.copy()
+                gallery = deque(maxlen=gallery_size)
+                entry['appearance_gallery'] = gallery
             else:
                 alpha = self.config.REID_APPEARANCE_UPDATE_WEIGHT
                 blended = ((1.0 - alpha) * existing) + (alpha * appearance)
                 norm = float(np.linalg.norm(blended))
                 entry['appearance'] = blended / norm if norm > 0 else appearance.copy()
-            gallery = entry.setdefault('appearance_gallery', deque(maxlen=self._gallery_size(entry['class_id'])))
+                gallery = deque(
+                    [
+                        feature for feature in (entry.get('appearance_gallery') or [])
+                        if self._same_feature_shape(appearance, feature)
+                    ],
+                    maxlen=gallery_size,
+                )
+                entry['appearance_gallery'] = gallery
+            gallery = entry.setdefault('appearance_gallery', deque(maxlen=gallery_size))
             gallery.append(appearance.copy())
 
     def _expire(self, frame_number: int):
@@ -483,7 +549,7 @@ class BGSRegistry:
         if observed_class_id == self.config.PERSON_CLASS_ID:
             return entry_class_id == observed_class_id
         if observed_class_id in self.config.BAG_CLASS_IDS:
-            return entry_class_id in self.config.BAG_CLASS_IDS
+            return entry_class_id == observed_class_id
         return entry_class_id == observed_class_id
 
     def _match_by_geometry(

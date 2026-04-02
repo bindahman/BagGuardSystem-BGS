@@ -27,6 +27,7 @@ class BagGuardSystem:
         max_fps: float,
         skip: int,
         half: bool,
+        tracker_backend: str = "deepsort",
         tracker_profile: str = "main",
         show: bool = False,
     ):
@@ -38,6 +39,7 @@ class BagGuardSystem:
         self.skip = max(0, int(skip))
         self.half = bool(half)
         self.show = bool(show)
+        self.tracker_backend = str(tracker_backend).strip().lower()
         self.tracker_profile = str(tracker_profile).strip().lower()
         self.config = BGSConfig
         resolved_model_path = os.path.abspath(model_path)
@@ -47,7 +49,7 @@ class BagGuardSystem:
         print("=" * 80)
         print("📋 Specification Compliance:")
         print("  ✓ Section 4: Object Detection (YOLOv8)")
-        print("  ✓ Section 5: Stable ID Tracking (ByteTrack)")
+        print("  ✓ Section 5: Stable ID Tracking (DeepSORT / ByteTrack)")
         print("  ✓ Section 6: Distance Estimation (Monocular Trigonometry)")
         print("  ✓ Section 7: Ownership Persistence (Trend-Based Logic)")
         print("  ✓ Section 8: Unattended Detection (3-State: OK/POTENTIAL/UNATTENDED)")
@@ -78,7 +80,10 @@ class BagGuardSystem:
         self.model.to(self.device)
 
         self._validate_class_config()
-        self.tracker_path = self._resolve_tracker_path()
+        self.tracker_path = None
+        self.person_tracker = None
+        self.bag_trackers = {}
+        self._configure_trackers()
         self._log_device()
         self._run_startup_inference()
 
@@ -86,7 +91,7 @@ class BagGuardSystem:
         self.ownership_manager = OwnershipManager(self.distance_estimator)
         self.visualizer = Visualizer()
         self.person_reid = PersonReIDEmbedder(self.device, self.config.REID_PERSON_MODEL_NAME, self._resolve_reid_model_path())
-        self.bag_reid = BagReIDEmbedder()
+        self.bag_reid = BagReIDEmbedder(self.device)
         person_registry_path, person_log_dir, bag_registry_path, bag_log_dir = self._resolve_reid_store_paths()
         self.id_registry = BGSRegistry(person_registry_path, person_log_dir, bag_registry_path, bag_log_dir)
 
@@ -132,8 +137,9 @@ class BagGuardSystem:
         print("✓ Class IDs and label mapping verified")
 
     def _log_device(self):
+        tracker_profile = self.tracker_profile if self.tracker_backend == "bytetrack" else "-"
         print(f"✓ Device: {self.device}")
-        print(f"✓ Runtime: imgsz={self.imgsz} max_fps={self.max_fps} skip={self.skip} half={self.half} tracker_profile={self.tracker_profile}")
+        print(f"✓ Runtime: imgsz={self.imgsz} max_fps={self.max_fps} skip={self.skip} half={self.half} tracker_backend={self.tracker_backend} tracker_profile={tracker_profile}")
 
     def _log_loaded_registry_counts(self):
         if self.id_registry.loaded_person_count:
@@ -155,6 +161,229 @@ class BagGuardSystem:
     @staticmethod
     def _bbox(box) -> List[float]:
         return box.xyxy[0].cpu().numpy().tolist()
+
+    @staticmethod
+    def _normalize_embedding(embedding: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if embedding is None:
+            return None
+
+        vector = np.asarray(embedding, dtype=np.float32)
+        norm = float(np.linalg.norm(vector))
+        return vector / norm if norm > 0 else None
+
+    @staticmethod
+    def _coerce_track_id(track_id) -> Optional[int]:
+        if track_id is None:
+            return None
+        try:
+            return int(track_id)
+        except (TypeError, ValueError):
+            try:
+                return int(str(track_id).rsplit("_", 1)[-1])
+            except (TypeError, ValueError):
+                return None
+
+    @staticmethod
+    def _namespace_track_id(namespace: int, track_id: Optional[int]) -> Optional[int]:
+        if track_id is None:
+            return None
+        return (int(namespace) * 1_000_000) + int(track_id)
+
+    def _build_detection_input(
+        self,
+        source_index: int,
+        class_id: int,
+        bbox: List[float],
+        conf: float,
+        appearance: Optional[np.ndarray],
+        tracker_id: Optional[int] = None,
+    ) -> Dict:
+        return {
+            'source_index': int(source_index),
+            'class_id': int(class_id),
+            'bbox': [float(value) for value in bbox],
+            'conf': float(conf),
+            'appearance': self._normalize_embedding(appearance),
+            'tracker_id': tracker_id,
+        }
+
+    def _build_detection_inputs(self, boxes, frame: np.ndarray) -> List[Dict]:
+        detections: List[Dict] = []
+        if boxes is None or len(boxes) == 0:
+            return detections
+
+        person_appearances = self._collect_person_appearances(boxes, frame)
+        bag_appearances = self._collect_bag_appearances(boxes, frame)
+
+        for i in range(len(boxes)):
+            class_id = int(boxes[i].cls[0])
+            conf = float(boxes[i].conf[0])
+            if class_id not in self.config.CLASS_IDS or not self._passes_conf_threshold(class_id, conf):
+                continue
+
+            appearance = person_appearances.get(i) if class_id == self.config.PERSON_CLASS_ID else bag_appearances.get(i)
+            detections.append(
+                self._build_detection_input(
+                    source_index=i,
+                    class_id=class_id,
+                    bbox=self._bbox(boxes[i]),
+                    conf=conf,
+                    appearance=appearance,
+                    tracker_id=self._track_id(boxes[i]),
+                )
+            )
+
+        return detections
+
+    def _deepsort_kwargs(self, max_age: int, max_cosine_distance: float) -> Dict:
+        return {
+            'max_iou_distance': self.config.DEEPSORT_MAX_IOU_DISTANCE,
+            'max_age': max_age,
+            'n_init': self.config.DEEPSORT_N_INIT,
+            'nms_max_overlap': self.config.DEEPSORT_NMS_MAX_OVERLAP,
+            'max_cosine_distance': max_cosine_distance,
+            'nn_budget': self.config.DEEPSORT_NN_BUDGET,
+            'embedder': None,
+            'gating_only_position': False,
+        }
+
+    def _configure_trackers(self):
+        if self.tracker_backend == "bytetrack":
+            self.tracker_path = self._resolve_tracker_path()
+            print(f"✓ Tracking backend loaded: ByteTrack ({self.tracker_profile})")
+            return
+
+        if self.tracker_backend == "deepsort":
+            self._init_deepsort_trackers()
+            print("✓ Tracking backend loaded: DeepSORT")
+            return
+
+        print(f"❌ Invalid tracker backend: {self.tracker_backend}")
+        print("Allowed backends: deepsort, bytetrack")
+        sys.exit(1)
+
+    def _init_deepsort_trackers(self):
+        try:
+            from deep_sort_realtime.deepsort_tracker import DeepSort
+        except Exception as e:
+            print(f"❌ DeepSORT import failed: {e}")
+            print("Install dependency: deep-sort-realtime")
+            sys.exit(1)
+
+        self.person_tracker = DeepSort(
+            **self._deepsort_kwargs(
+                self.config.DEEPSORT_PERSON_MAX_AGE,
+                self.config.DEEPSORT_PERSON_MAX_COSINE_DISTANCE,
+            )
+        )
+        self.bag_trackers = {
+            class_id: DeepSort(
+                **self._deepsort_kwargs(
+                    self.config.DEEPSORT_BAG_MAX_AGE,
+                    self.config.DEEPSORT_BAG_MAX_COSINE_DISTANCE,
+                )
+            )
+            for class_id in self.config.BAG_CLASS_IDS
+        }
+
+    def _run_deepsort_tracker(self, tracker, detections: List[Dict], namespace: int) -> Dict[int, Dict]:
+        detection_map = {int(det['source_index']): det for det in detections}
+        raw_detections = []
+        embeddings = []
+        others = []
+
+        for detection in detections:
+            appearance = detection.get('appearance')
+            if appearance is None:
+                continue
+
+            x1, y1, x2, y2 = detection['bbox']
+            raw_detections.append((
+                [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+                float(detection['conf']),
+                self.config.TARGET_CLASSES[detection['class_id']],
+            ))
+            embeddings.append(appearance)
+            others.append({'source_index': int(detection['source_index'])})
+
+        tracks = tracker.update_tracks(raw_detections, embeds=embeddings, others=others)
+        tracked_by_source: Dict[int, Dict] = {}
+
+        for track in tracks:
+            if track.time_since_update != 0:
+                continue
+
+            supplementary = track.get_det_supplementary() or {}
+            source_index = supplementary.get('source_index')
+            if source_index is None:
+                continue
+
+            source_index = int(source_index)
+            base_detection = detection_map.get(source_index)
+            if base_detection is None:
+                continue
+
+            bbox = track.to_ltrb(orig=True, orig_strict=True)
+            local_track_id = self._coerce_track_id(track.track_id)
+            if bbox is None or local_track_id is None:
+                continue
+
+            appearance = self._normalize_embedding(track.get_feature())
+            if appearance is None:
+                appearance = base_detection.get('appearance')
+
+            tracked_by_source[source_index] = self._build_detection_input(
+                source_index=source_index,
+                class_id=base_detection['class_id'],
+                bbox=np.asarray(bbox, dtype=np.float32).tolist(),
+                conf=float(track.get_det_conf() or base_detection['conf']),
+                appearance=appearance,
+                tracker_id=self._namespace_track_id(namespace, local_track_id),
+            )
+
+        return tracked_by_source
+
+    def _apply_deepsort_tracking(self, detections: List[Dict]) -> List[Dict]:
+        tracked_by_source: Dict[int, Dict] = {}
+
+        person_detections = [
+            detection for detection in detections
+            if detection['class_id'] == self.config.PERSON_CLASS_ID and detection.get('appearance') is not None
+        ]
+        tracked_by_source.update(self._run_deepsort_tracker(self.person_tracker, person_detections, self.config.PERSON_CLASS_ID + 1))
+
+        for class_id in self.config.BAG_CLASS_IDS:
+            class_detections = [
+                detection for detection in detections
+                if detection['class_id'] == class_id and detection.get('appearance') is not None
+            ]
+            tracked_by_source.update(self._run_deepsort_tracker(self.bag_trackers[class_id], class_detections, class_id + 100))
+
+        return [tracked_by_source.get(int(detection['source_index']), detection) for detection in detections]
+
+    def _detect_and_track(self, frame: np.ndarray) -> List[Dict]:
+        common_kwargs = {
+            'conf': min(self.config.PERSON_CONF, self.config.BAG_CONF),
+            'iou': self.config.IOU_THRESHOLD,
+            'classes': self.config.CLASS_IDS,
+            'imgsz': self.imgsz,
+            'device': self.device,
+            'half': self.half,
+            'verbose': False,
+        }
+
+        if self.tracker_backend == "bytetrack":
+            results = self.model.track(
+                frame,
+                persist=self.config.PERSIST,
+                tracker=self.tracker_path,
+                **common_kwargs,
+            )
+            return self._build_detection_inputs(results[0].boxes, frame)
+
+        results = self.model.predict(frame, **common_kwargs)
+        detections = self._build_detection_inputs(results[0].boxes, frame)
+        return self._apply_deepsort_tracking(detections)
 
     def _build_detection(
         self,
@@ -219,22 +448,30 @@ class BagGuardSystem:
         if not self.bag_reid.enabled:
             return bag_appearances
 
+        bag_indices = []
+        bag_crops = []
         for i in range(len(boxes)):
             cls_id = int(boxes[i].cls[0])
             conf = float(boxes[i].conf[0])
             if cls_id not in self.config.BAG_CLASS_IDS or not self._passes_conf_threshold(cls_id, conf):
                 continue
             crop = self.bag_reid.crop_bag(frame, self._bbox(boxes[i]))
-            embedding = self.bag_reid.extract_one(crop)
+            if crop is None:
+                continue
+            bag_indices.append(i)
+            bag_crops.append(crop)
+
+        for idx, embedding in zip(bag_indices, self.bag_reid.extract(bag_crops)):
             if embedding is not None:
-                bag_appearances[i] = embedding
+                bag_appearances[idx] = embedding
         return bag_appearances
 
-    def _resolve_person_detection(self, box, frame: np.ndarray, appearance: Optional[np.ndarray]) -> Dict:
-        cls_id = int(box.cls[0])
-        bbox = self._bbox(box)
-        conf = float(box.conf[0])
-        bt_id = self._track_id(box)
+    def _resolve_person_detection(self, detection: Dict, frame: np.ndarray) -> Dict:
+        cls_id = int(detection['class_id'])
+        bbox = detection['bbox']
+        conf = float(detection['conf'])
+        bt_id = detection.get('tracker_id')
+        appearance = detection.get('appearance')
         stable_id, match_meta = self.id_registry.resolve(bbox, cls_id, self.frame_count, bt_id, appearance=appearance)
         position_3d = self.distance_estimator.estimate_position_3d(bbox, is_person=True)
         self.id_registry.log_person_frame(stable_id, self.frame_count, frame, bbox, match_meta=match_meta, bt_id=bt_id)
@@ -244,16 +481,16 @@ class BagGuardSystem:
 
     def _resolve_bag_detection(
         self,
-        box,
+        detection: Dict,
         frame: np.ndarray,
         people: List[Dict],
-        appearance: Optional[np.ndarray],
     ) -> Dict:
-        cls_id = int(box.cls[0])
-        bbox = self._bbox(box)
-        conf = float(box.conf[0])
+        cls_id = int(detection['class_id'])
+        bbox = detection['bbox']
+        conf = float(detection['conf'])
+        appearance = detection.get('appearance')
         owner_hint = self._estimate_bag_owner_hint(bbox, people)
-        bt_id = self._track_id(box)
+        bt_id = detection.get('tracker_id')
         stable_id, match_meta = self.id_registry.resolve(
             bbox,
             cls_id,
@@ -430,37 +667,33 @@ class BagGuardSystem:
             print(f"  {label}: {class_counts.get(cid, 0)}")
         print(f"  Bags total: {bag_count}")
 
-    def extract_detections(self, results, frame: np.ndarray) -> Tuple[List[Dict], List[Dict]]:
+    def extract_detections(self, detections: List[Dict], frame: np.ndarray) -> Tuple[List[Dict], List[Dict]]:
         people = []
         bags = []
-        if results[0].boxes is None or len(results[0].boxes) == 0:
+        if not detections:
             return people, bags
 
-        boxes = results[0].boxes
-        person_appearances = self._collect_person_appearances(boxes, frame)
-        bag_appearances = self._collect_bag_appearances(boxes, frame)
-
-        for i in range(len(boxes)):
-            cls_id = int(boxes[i].cls[0])
+        for detection in detections:
+            cls_id = int(detection['class_id'])
             if cls_id != self.config.PERSON_CLASS_ID:
                 continue
 
-            conf = float(boxes[i].conf[0])
+            conf = float(detection['conf'])
             if not self._passes_conf_threshold(cls_id, conf):
                 continue
 
-            people.append(self._resolve_person_detection(boxes[i], frame, person_appearances.get(i)))
+            people.append(self._resolve_person_detection(detection, frame))
 
-        for i in range(len(boxes)):
-            cls_id = int(boxes[i].cls[0])
+        for detection in detections:
+            cls_id = int(detection['class_id'])
             if cls_id not in self.config.CLASS_IDS or cls_id == self.config.PERSON_CLASS_ID:
                 continue
 
-            conf = float(boxes[i].conf[0])
+            conf = float(detection['conf'])
             if not self._passes_conf_threshold(cls_id, conf):
                 continue
 
-            bags.append(self._resolve_bag_detection(boxes[i], frame, people, bag_appearances.get(i)))
+            bags.append(self._resolve_bag_detection(detection, frame, people))
 
         return people, bags
 
@@ -509,20 +742,8 @@ class BagGuardSystem:
 
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict]:
         current_time = time.time()
-        results = self.model.track(
-            frame,
-            persist=self.config.PERSIST,
-            conf=min(self.config.PERSON_CONF, self.config.BAG_CONF),
-            iou=self.config.IOU_THRESHOLD,
-            classes=self.config.CLASS_IDS,
-            tracker=self.tracker_path,
-            imgsz=self.imgsz,
-            device=self.device,
-            half=self.half,
-            verbose=False,
-        )
-
-        people, bags = self.extract_detections(results, frame)
+        detections = self._detect_and_track(frame)
+        people, bags = self.extract_detections(detections, frame)
         self._refine_bag_depths(bags, people)
 
         bag_states = self.ownership_manager.update_ownership(bags, people, current_time)
