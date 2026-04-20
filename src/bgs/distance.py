@@ -9,11 +9,6 @@ class DistanceEstimator:
     def __init__(self):
         self.config = BGSConfig
 
-    @staticmethod
-    def _bbox_center(bbox: List[float]) -> Tuple[float, float]:
-        x1, y1, x2, y2 = bbox
-        return (x1 + x2) / 2, (y1 + y2) / 2
-
     def estimate_depth(self, bbox_height_pixels: float, real_height_meters: float = None) -> float:
         if real_height_meters is None:
             real_height_meters = self.config.ASSUMED_PERSON_HEIGHT
@@ -53,17 +48,3 @@ class DistanceEstimator:
         x1, y1, z1 = pos1
         x2, y2, z2 = pos2
         return np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
-
-    def calculate_ground_distance(
-        self,
-        pos1: Tuple[float, float, float],
-        pos2: Tuple[float, float, float],
-    ) -> float:
-        x1, _, z1 = pos1
-        x2, _, z2 = pos2
-        return float(np.sqrt((x2 - x1) ** 2 + (z2 - z1) ** 2))
-
-    def calculate_image_distance(self, bbox_a: List[float], bbox_b: List[float]) -> float:
-        ax, ay = self._bbox_center(bbox_a)
-        bx, by = self._bbox_center(bbox_b)
-        return float(np.hypot(ax - bx, ay - by))

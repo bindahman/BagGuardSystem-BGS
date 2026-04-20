@@ -10,6 +10,3 @@ __pycache__/
 
 # Video artifacts
 *.mp4
-
-# Generated model exports
-*_openvino_model/

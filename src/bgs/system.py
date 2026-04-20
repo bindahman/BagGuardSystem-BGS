@@ -2,8 +2,6 @@ import os
 import sys
 import time
 from pathlib import Path
-from queue import Queue
-from threading import Thread
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
@@ -19,36 +17,6 @@ from .reid import BGSRegistry, BagReIDEmbedder, PersonReIDEmbedder
 from .visualization import Visualizer
 
 
-class AsyncVideoWriter:
-    def __init__(self, output_path: str, fourcc: int, fps: int, frame_size: Tuple[int, int], max_queue_size: int = 32):
-        self._writer = cv2.VideoWriter(output_path, fourcc, fps, frame_size)
-        self._queue: Queue = Queue(maxsize=max_queue_size)
-        self._worker_thread = Thread(target=self._run, name="bgs-video-writer", daemon=True)
-        self._worker_thread.start()
-
-    def write(self, frame: np.ndarray):
-        self._queue.put(frame.copy())
-
-    def flush(self):
-        self._queue.join()
-
-    def close(self):
-        self.flush()
-        self._queue.put(None)
-        self._worker_thread.join(timeout=5.0)
-        self._writer.release()
-
-    def _run(self):
-        while True:
-            frame = self._queue.get()
-            try:
-                if frame is None:
-                    return
-                self._writer.write(frame)
-            finally:
-                self._queue.task_done()
-
-
 class BagGuardSystem:
     def __init__(
         self,
@@ -59,9 +27,6 @@ class BagGuardSystem:
         max_fps: float,
         skip: int,
         half: bool,
-        detector_runtime: str = "torch",
-        openvino_device: str = "auto",
-        tracker_backend: str = "deepsort",
         tracker_profile: str = "main",
         show: bool = False,
     ):
@@ -73,16 +38,8 @@ class BagGuardSystem:
         self.skip = max(0, int(skip))
         self.half = bool(half)
         self.show = bool(show)
-        self.detector_runtime = str(detector_runtime).strip().lower()
-        self.openvino_device = str(openvino_device).strip().lower()
-        self.tracker_backend = str(tracker_backend).strip().lower()
         self.tracker_profile = str(tracker_profile).strip().lower()
         self.config = BGSConfig
-        self.model = None
-        self.openvino_compiled_model = None
-        self.openvino_output_layer = None
-        self.openvino_input_hw: Optional[Tuple[int, int]] = None
-        self._deepsort_track_memory: Dict[int, Dict] = {}
         resolved_model_path = os.path.abspath(model_path)
 
         print("\n" + "=" * 80)
@@ -90,7 +47,7 @@ class BagGuardSystem:
         print("=" * 80)
         print("📋 Specification Compliance:")
         print("  ✓ Section 4: Object Detection (YOLOv8)")
-        print("  ✓ Section 5: Stable ID Tracking (DeepSORT / ByteTrack)")
+        print("  ✓ Section 5: Stable ID Tracking (ByteTrack)")
         print("  ✓ Section 6: Distance Estimation (Monocular Trigonometry)")
         print("  ✓ Section 7: Ownership Persistence (Trend-Based Logic)")
         print("  ✓ Section 8: Unattended Detection (3-State: OK/POTENTIAL/UNATTENDED)")
@@ -107,48 +64,29 @@ class BagGuardSystem:
             print(f"❌ Weights file not found: {resolved_model_path}")
             sys.exit(1)
 
-        self.cuda_available = torch.cuda.is_available()
-        self.device = "cuda:0" if self.cuda_available else "cpu"
-        self.torch_device = self.device
-        if not self.cuda_available:
-            self.half = False
-
-        if self.detector_runtime == "openvino":
-            if self.tracker_backend == "bytetrack":
-                print("❌ OpenVINO detector runtime is currently supported with DeepSORT tracking only")
-                sys.exit(1)
-            self.detector_model_path = self._resolve_openvino_model_path(resolved_model_path)
-            self.detector_device = self._resolve_openvino_device_arg()
-        else:
-            self.detector_model_path = resolved_model_path
-            self.detector_device = self.device
-
         try:
-            if self.detector_runtime == "openvino":
-                self._load_openvino_runtime()
-            else:
-                self.model = self._load_detector_model()
-            print(f"✓ YOLO model loaded successfully ({self.detector_runtime})")
+            self.model = YOLO(resolved_model_path)
+            print("✓ YOLO model loaded successfully")
         except Exception as e:
             print(f"❌ Error loading model: {e}")
             sys.exit(1)
 
-        if self.detector_runtime == "torch":
-            self.model.to(self.device)
+        self.cuda_available = torch.cuda.is_available()
+        self.device = "cuda:0" if self.cuda_available else "cpu"
+        if not self.cuda_available:
+            self.half = False
+        self.model.to(self.device)
 
         self._validate_class_config()
-        self.tracker_path = None
-        self.person_tracker = None
-        self.bag_trackers = {}
-        self._configure_trackers()
+        self.tracker_path = self._resolve_tracker_path()
         self._log_device()
         self._run_startup_inference()
 
         self.distance_estimator = DistanceEstimator()
         self.ownership_manager = OwnershipManager(self.distance_estimator)
         self.visualizer = Visualizer()
-        self.person_reid = PersonReIDEmbedder(self.torch_device, self.config.REID_PERSON_MODEL_NAME, self._resolve_reid_model_path())
-        self.bag_reid = BagReIDEmbedder(self.torch_device)
+        self.person_reid = PersonReIDEmbedder(self.device, self.config.REID_PERSON_MODEL_NAME, self._resolve_reid_model_path())
+        self.bag_reid = BagReIDEmbedder()
         person_registry_path, person_log_dir, bag_registry_path, bag_log_dir = self._resolve_reid_store_paths()
         self.id_registry = BGSRegistry(person_registry_path, person_log_dir, bag_registry_path, bag_log_dir)
 
@@ -194,86 +132,8 @@ class BagGuardSystem:
         print("✓ Class IDs and label mapping verified")
 
     def _log_device(self):
-        tracker_profile = self.tracker_profile if self.tracker_backend == "bytetrack" else "-"
-        print(f"✓ Torch device: {self.torch_device}")
-        print(f"✓ Detector runtime: {self.detector_runtime} ({self.detector_device})")
-        print(f"✓ Runtime: imgsz={self.imgsz} max_fps={self.max_fps} skip={self.skip} half={self.half} tracker_backend={self.tracker_backend} tracker_profile={tracker_profile}")
-
-    def _load_detector_model(self):
-        return YOLO(self.detector_model_path, task="detect")
-
-    def _load_openvino_runtime(self):
-        import openvino as ov
-
-        xml_path = self._resolve_openvino_xml_path()
-        core = ov.Core()
-        self.openvino_compiled_model = core.compile_model(
-            str(xml_path),
-            self.detector_device,
-            {"PERFORMANCE_HINT": "LATENCY"},
-        )
-        input_shape = self.openvino_compiled_model.input(0).shape
-        self.openvino_output_layer = self.openvino_compiled_model.output(0)
-        self.openvino_input_hw = (int(input_shape[2]), int(input_shape[3]))
-
-    def _resolve_openvino_xml_path(self) -> Path:
-        model_path = Path(self.detector_model_path)
-        if model_path.is_file() and model_path.suffix.lower() == ".xml":
-            return model_path
-
-        xml_files = sorted(model_path.glob("*.xml"))
-        if not xml_files:
-            raise FileNotFoundError(f"No OpenVINO XML model found in: {model_path}")
-        return xml_files[0]
-
-    def _resolve_openvino_device_arg(self) -> str:
-        if self.openvino_device in {"", "auto", "cpu"}:
-            return "CPU"
-        if self.openvino_device == "gpu":
-            return "GPU"
-        print(f"❌ Unsupported OpenVINO device: {self.openvino_device}")
-        print("Allowed values: auto, cpu, gpu")
-        sys.exit(1)
-
-    def _resolve_openvino_model_path(self, resolved_model_path: str) -> str:
-        model_path = Path(resolved_model_path)
-
-        if model_path.is_dir() and model_path.name.endswith("_openvino_model"):
-            return str(model_path)
-        if model_path.suffix.lower() == ".xml":
-            return str(model_path.parent)
-        if model_path.suffix.lower() != ".pt":
-            print("❌ OpenVINO runtime currently expects a .pt weights file or an exported *_openvino_model directory")
-            sys.exit(1)
-
-        export_dir = model_path.with_name(f"{model_path.stem}_openvino_model")
-        export_xml = export_dir / f"{model_path.stem}.xml"
-        if export_xml.exists():
-            print(f"✓ Reusing cached OpenVINO detector: {export_dir}")
-            return str(export_dir)
-
-        try:
-            export_model = YOLO(str(model_path))
-            print(f"⚠️  Exporting detector to OpenVINO: {export_dir}")
-            exported_path = export_model.export(
-                format="openvino",
-                imgsz=self.imgsz,
-                half=bool(self.config.OPENVINO_EXPORT_HALF),
-                int8=False,
-                dynamic=False,
-                nms=False,
-            )
-        except Exception as e:
-            print(f"❌ OpenVINO export failed: {e}")
-            sys.exit(1)
-
-        exported_dir = Path(str(exported_path))
-        if exported_dir.is_file():
-            exported_dir = exported_dir.parent
-        if not (exported_dir / f"{model_path.stem}.xml").exists():
-            print(f"❌ OpenVINO export did not produce the expected model files in: {exported_dir}")
-            sys.exit(1)
-        return str(exported_dir)
+        print(f"✓ Device: {self.device}")
+        print(f"✓ Runtime: imgsz={self.imgsz} max_fps={self.max_fps} skip={self.skip} half={self.half} tracker_profile={self.tracker_profile}")
 
     def _log_loaded_registry_counts(self):
         if self.id_registry.loaded_person_count:
@@ -295,410 +155,6 @@ class BagGuardSystem:
     @staticmethod
     def _bbox(box) -> List[float]:
         return box.xyxy[0].cpu().numpy().tolist()
-
-    @staticmethod
-    def _normalize_embedding(embedding: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        if embedding is None:
-            return None
-
-        vector = np.asarray(embedding, dtype=np.float32)
-        norm = float(np.linalg.norm(vector))
-        return vector / norm if norm > 0 else None
-
-    @staticmethod
-    def _coerce_track_id(track_id) -> Optional[int]:
-        if track_id is None:
-            return None
-        try:
-            return int(track_id)
-        except (TypeError, ValueError):
-            try:
-                return int(str(track_id).rsplit("_", 1)[-1])
-            except (TypeError, ValueError):
-                return None
-
-    @staticmethod
-    def _namespace_track_id(namespace: int, track_id: Optional[int]) -> Optional[int]:
-        if track_id is None:
-            return None
-        return (int(namespace) * 1_000_000) + int(track_id)
-
-    def _build_detection_input(
-        self,
-        source_index: int,
-        class_id: int,
-        bbox: List[float],
-        conf: float,
-        appearance: Optional[np.ndarray],
-        tracker_id: Optional[int] = None,
-    ) -> Dict:
-        return {
-            'source_index': int(source_index),
-            'class_id': int(class_id),
-            'bbox': [float(value) for value in bbox],
-            'conf': float(conf),
-            'appearance': self._normalize_embedding(appearance),
-            'tracker_id': tracker_id,
-        }
-
-    def _build_detection_inputs(self, boxes, frame: np.ndarray) -> List[Dict]:
-        detections: List[Dict] = []
-        if boxes is None or len(boxes) == 0:
-            return detections
-
-        person_appearances = self._collect_person_appearances(boxes, frame)
-        bag_appearances = self._collect_bag_appearances(boxes, frame)
-
-        for i in range(len(boxes)):
-            class_id = int(boxes[i].cls[0])
-            conf = float(boxes[i].conf[0])
-            if class_id not in self.config.CLASS_IDS or not self._passes_conf_threshold(class_id, conf):
-                continue
-
-            appearance = person_appearances.get(i) if class_id == self.config.PERSON_CLASS_ID else bag_appearances.get(i)
-            detections.append(
-                self._build_detection_input(
-                    source_index=i,
-                    class_id=class_id,
-                    bbox=self._bbox(boxes[i]),
-                    conf=conf,
-                    appearance=appearance,
-                    tracker_id=self._track_id(boxes[i]),
-                )
-            )
-
-        return detections
-
-    @staticmethod
-    def _letterbox_frame(frame: np.ndarray, new_shape: Tuple[int, int], color: Tuple[int, int, int] = (114, 114, 114)):
-        shape = frame.shape[:2]
-        ratio = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-        new_unpad = (int(round(shape[1] * ratio)), int(round(shape[0] * ratio)))
-        dw = (new_shape[1] - new_unpad[0]) / 2
-        dh = (new_shape[0] - new_unpad[1]) / 2
-
-        if shape[::-1] != new_unpad:
-            frame = cv2.resize(frame, new_unpad, interpolation=cv2.INTER_LINEAR)
-
-        top = int(round(dh - 0.1))
-        bottom = int(round(dh + 0.1))
-        left = int(round(dw - 0.1))
-        right = int(round(dw + 0.1))
-        frame = cv2.copyMakeBorder(frame, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
-        return frame, ratio, (dw, dh)
-
-    def _infer_openvino_records(self, frame: np.ndarray, conf_threshold: float) -> List[Dict]:
-        if self.openvino_compiled_model is None or self.openvino_output_layer is None or self.openvino_input_hw is None:
-            return []
-
-        frame_h, frame_w = frame.shape[:2]
-        image, ratio, (pad_x, pad_y) = self._letterbox_frame(frame, self.openvino_input_hw)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        image = np.transpose(image, (2, 0, 1))[None]
-        raw_output = self.openvino_compiled_model([image])[self.openvino_output_layer][0]
-
-        records: List[Dict] = []
-        for row in raw_output:
-            x1, y1, x2, y2, conf, class_id = row.tolist()
-            class_id = int(class_id)
-            conf = float(conf)
-            if conf < conf_threshold or class_id not in self.config.CLASS_IDS:
-                continue
-
-            x1 = max(0.0, min((x1 - pad_x) / ratio, frame_w - 1))
-            y1 = max(0.0, min((y1 - pad_y) / ratio, frame_h - 1))
-            x2 = max(0.0, min((x2 - pad_x) / ratio, frame_w - 1))
-            y2 = max(0.0, min((y2 - pad_y) / ratio, frame_h - 1))
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            records.append({
-                'source_index': len(records),
-                'class_id': class_id,
-                'bbox': [x1, y1, x2, y2],
-                'conf': conf,
-            })
-
-        return records
-
-    def _build_detection_inputs_from_records(self, records: List[Dict], frame: np.ndarray) -> List[Dict]:
-        detections: List[Dict] = []
-        if not records:
-            return detections
-
-        person_indices: List[int] = []
-        person_crops: List[np.ndarray] = []
-        bag_indices: List[int] = []
-        bag_crops: List[np.ndarray] = []
-
-        for record in records:
-            class_id = int(record['class_id'])
-            conf = float(record['conf'])
-            if not self._passes_conf_threshold(class_id, conf):
-                continue
-
-            bbox = record['bbox']
-            if class_id == self.config.PERSON_CLASS_ID and self.person_reid.enabled:
-                crop = self.person_reid.crop_person(frame, bbox)
-                if crop is not None:
-                    person_indices.append(int(record['source_index']))
-                    person_crops.append(crop)
-            elif class_id in self.config.BAG_CLASS_IDS and self.bag_reid.enabled:
-                crop = self.bag_reid.crop_bag(frame, bbox)
-                if crop is not None:
-                    bag_indices.append(int(record['source_index']))
-                    bag_crops.append(crop)
-
-        person_appearances: Dict[int, np.ndarray] = {}
-        for source_index, embedding in zip(person_indices, self.person_reid.extract(person_crops)):
-            if embedding is not None:
-                person_appearances[source_index] = embedding
-
-        bag_appearances: Dict[int, np.ndarray] = {}
-        for source_index, embedding in zip(bag_indices, self.bag_reid.extract(bag_crops)):
-            if embedding is not None:
-                bag_appearances[source_index] = embedding
-
-        for record in records:
-            source_index = int(record['source_index'])
-            class_id = int(record['class_id'])
-            conf = float(record['conf'])
-            if not self._passes_conf_threshold(class_id, conf):
-                continue
-
-            appearance = person_appearances.get(source_index) if class_id == self.config.PERSON_CLASS_ID else bag_appearances.get(source_index)
-            detections.append(
-                self._build_detection_input(
-                    source_index=source_index,
-                    class_id=class_id,
-                    bbox=record['bbox'],
-                    conf=conf,
-                    appearance=appearance,
-                )
-            )
-
-        return detections
-
-    def _deepsort_kwargs(self, max_age: int, max_cosine_distance: float) -> Dict:
-        return {
-            'max_iou_distance': self.config.DEEPSORT_MAX_IOU_DISTANCE,
-            'max_age': max_age,
-            'n_init': self.config.DEEPSORT_N_INIT,
-            'nms_max_overlap': self.config.DEEPSORT_NMS_MAX_OVERLAP,
-            'max_cosine_distance': max_cosine_distance,
-            'nn_budget': self.config.DEEPSORT_NN_BUDGET,
-            'embedder': None,
-            'gating_only_position': False,
-        }
-
-    def _deepsort_output_max_age(self, class_id: int) -> int:
-        if class_id == self.config.PERSON_CLASS_ID:
-            return self.config.DEEPSORT_PERSON_OUTPUT_MAX_AGE
-        return self.config.DEEPSORT_BAG_OUTPUT_MAX_AGE
-
-    def _prune_deepsort_track_memory(self):
-        max_age = max(self.config.DEEPSORT_PERSON_MAX_AGE, self.config.DEEPSORT_BAG_MAX_AGE)
-        min_frame = self.frame_count - max_age - 2
-        self._deepsort_track_memory = {
-            track_id: entry
-            for track_id, entry in self._deepsort_track_memory.items()
-            if int(entry.get('last_frame', min_frame)) >= min_frame
-        }
-
-    def _configure_trackers(self):
-        if self.tracker_backend == "bytetrack":
-            self.tracker_path = self._resolve_tracker_path()
-            print(f"✓ Tracking backend loaded: ByteTrack ({self.tracker_profile})")
-            return
-
-        if self.tracker_backend == "deepsort":
-            self._init_deepsort_trackers()
-            print("✓ Tracking backend loaded: DeepSORT")
-            return
-
-        print(f"❌ Invalid tracker backend: {self.tracker_backend}")
-        print("Allowed backends: deepsort, bytetrack")
-        sys.exit(1)
-
-    def _init_deepsort_trackers(self):
-        try:
-            from deep_sort_realtime.deepsort_tracker import DeepSort
-        except Exception as e:
-            print(f"❌ DeepSORT import failed: {e}")
-            print("Install dependency: deep-sort-realtime")
-            sys.exit(1)
-
-        self.person_tracker = DeepSort(
-            **self._deepsort_kwargs(
-                self.config.DEEPSORT_PERSON_MAX_AGE,
-                self.config.DEEPSORT_PERSON_MAX_COSINE_DISTANCE,
-            )
-        )
-        self.bag_trackers = {
-            class_id: DeepSort(
-                **self._deepsort_kwargs(
-                    self.config.DEEPSORT_BAG_MAX_AGE,
-                    self.config.DEEPSORT_BAG_MAX_COSINE_DISTANCE,
-                )
-            )
-            for class_id in self.config.BAG_CLASS_IDS
-        }
-
-    def _run_deepsort_tracker(self, tracker, detections: List[Dict], namespace: int, output_max_age: int) -> Tuple[Dict[int, Dict], List[Dict]]:
-        detection_map = {int(det['source_index']): det for det in detections}
-        raw_detections = []
-        embeddings = []
-        others = []
-
-        for detection in detections:
-            appearance = detection.get('appearance')
-            if appearance is None:
-                continue
-
-            x1, y1, x2, y2 = detection['bbox']
-            raw_detections.append((
-                [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
-                float(detection['conf']),
-                self.config.TARGET_CLASSES[detection['class_id']],
-            ))
-            embeddings.append(appearance)
-            others.append({'source_index': int(detection['source_index'])})
-
-        tracks = tracker.update_tracks(raw_detections, embeds=embeddings, others=others)
-        tracked_by_source: Dict[int, Dict] = {}
-        predicted_tracks: List[Dict] = []
-
-        for track in tracks:
-            if not track.is_confirmed():
-                continue
-
-            local_track_id = self._coerce_track_id(track.track_id)
-            if local_track_id is None:
-                continue
-
-            namespaced_track_id = self._namespace_track_id(namespace, local_track_id)
-            if namespaced_track_id is None:
-                continue
-
-            bbox = track.to_ltrb(orig=track.time_since_update == 0, orig_strict=False)
-            if bbox is None:
-                continue
-
-            if track.time_since_update != 0:
-                if track.time_since_update > output_max_age:
-                    continue
-
-                cached_track = self._deepsort_track_memory.get(namespaced_track_id)
-                if cached_track is None:
-                    continue
-
-                predicted_tracks.append(
-                    self._build_detection_input(
-                        source_index=-(namespaced_track_id + track.time_since_update),
-                        class_id=int(cached_track['class_id']),
-                        bbox=np.asarray(bbox, dtype=np.float32).tolist(),
-                        conf=float(cached_track.get('conf', 0.0)),
-                        appearance=cached_track.get('appearance'),
-                        tracker_id=namespaced_track_id,
-                    )
-                )
-                continue
-
-            supplementary = track.get_det_supplementary() or {}
-            source_index = supplementary.get('source_index')
-            if source_index is None:
-                continue
-
-            source_index = int(source_index)
-            base_detection = detection_map.get(source_index)
-            if base_detection is None:
-                continue
-
-            appearance = self._normalize_embedding(track.get_feature())
-            if appearance is None:
-                appearance = base_detection.get('appearance')
-
-            conf = float(track.get_det_conf() or base_detection['conf'])
-            tracked_by_source[source_index] = self._build_detection_input(
-                source_index=source_index,
-                class_id=base_detection['class_id'],
-                bbox=np.asarray(bbox, dtype=np.float32).tolist(),
-                conf=conf,
-                appearance=appearance,
-                tracker_id=namespaced_track_id,
-            )
-            self._deepsort_track_memory[namespaced_track_id] = {
-                'class_id': int(base_detection['class_id']),
-                'conf': conf,
-                'appearance': appearance.copy() if appearance is not None else None,
-                'last_frame': self.frame_count,
-            }
-
-        return tracked_by_source, predicted_tracks
-
-    def _apply_deepsort_tracking(self, detections: List[Dict]) -> List[Dict]:
-        tracked_by_source: Dict[int, Dict] = {}
-        predicted_tracks: List[Dict] = []
-
-        person_detections = [
-            detection for detection in detections
-            if detection['class_id'] == self.config.PERSON_CLASS_ID and detection.get('appearance') is not None
-        ]
-        person_tracked, person_predicted = self._run_deepsort_tracker(
-            self.person_tracker,
-            person_detections,
-            self.config.PERSON_CLASS_ID + 1,
-            self._deepsort_output_max_age(self.config.PERSON_CLASS_ID),
-        )
-        tracked_by_source.update(person_tracked)
-        predicted_tracks.extend(person_predicted)
-
-        for class_id in self.config.BAG_CLASS_IDS:
-            class_detections = [
-                detection for detection in detections
-                if detection['class_id'] == class_id and detection.get('appearance') is not None
-            ]
-            class_tracked, class_predicted = self._run_deepsort_tracker(
-                self.bag_trackers[class_id],
-                class_detections,
-                class_id + 100,
-                self._deepsort_output_max_age(class_id),
-            )
-            tracked_by_source.update(class_tracked)
-            predicted_tracks.extend(class_predicted)
-
-        self._prune_deepsort_track_memory()
-        current_tracks = [tracked_by_source.get(int(detection['source_index']), detection) for detection in detections]
-        return current_tracks + predicted_tracks
-
-    def _detect_and_track(self, frame: np.ndarray) -> List[Dict]:
-        if self.detector_runtime == "openvino":
-            records = self._infer_openvino_records(frame, min(self.config.PERSON_CONF, self.config.BAG_CONF))
-            detections = self._build_detection_inputs_from_records(records, frame)
-            return self._apply_deepsort_tracking(detections)
-
-        common_kwargs = {
-            'conf': min(self.config.PERSON_CONF, self.config.BAG_CONF),
-            'iou': self.config.IOU_THRESHOLD,
-            'classes': self.config.CLASS_IDS,
-            'imgsz': self.imgsz,
-            'device': self.detector_device,
-            'half': self.half if self.detector_runtime == "torch" else False,
-            'verbose': False,
-        }
-
-        if self.tracker_backend == "bytetrack":
-            results = self.model.track(
-                frame,
-                persist=self.config.PERSIST,
-                tracker=self.tracker_path,
-                **common_kwargs,
-            )
-            return self._build_detection_inputs(results[0].boxes, frame)
-
-        results = self.model.predict(frame, **common_kwargs)
-        detections = self._build_detection_inputs(results[0].boxes, frame)
-        return self._apply_deepsort_tracking(detections)
 
     def _build_detection(
         self,
@@ -723,18 +179,15 @@ class BagGuardSystem:
         detection.update(extra)
         return detection
 
-    def _empty_stats(self, frame_number: int) -> Dict:
+    @staticmethod
+    def _empty_stats(frame_number: int) -> Dict:
         return {
             'fps': 0,
-            'raw_detections': 0,
             'people_count': 0,
             'bags_count': 0,
             'bags_ok': 0,
             'bags_potential': 0,
             'bags_unattended': 0,
-            'detector_runtime': self.detector_runtime,
-            'detector_device': self.detector_device,
-            'tracker_backend': self.tracker_backend,
             'frame_number': frame_number,
         }
 
@@ -766,30 +219,22 @@ class BagGuardSystem:
         if not self.bag_reid.enabled:
             return bag_appearances
 
-        bag_indices = []
-        bag_crops = []
         for i in range(len(boxes)):
             cls_id = int(boxes[i].cls[0])
             conf = float(boxes[i].conf[0])
             if cls_id not in self.config.BAG_CLASS_IDS or not self._passes_conf_threshold(cls_id, conf):
                 continue
             crop = self.bag_reid.crop_bag(frame, self._bbox(boxes[i]))
-            if crop is None:
-                continue
-            bag_indices.append(i)
-            bag_crops.append(crop)
-
-        for idx, embedding in zip(bag_indices, self.bag_reid.extract(bag_crops)):
+            embedding = self.bag_reid.extract_one(crop)
             if embedding is not None:
-                bag_appearances[idx] = embedding
+                bag_appearances[i] = embedding
         return bag_appearances
 
-    def _resolve_person_detection(self, detection: Dict, frame: np.ndarray) -> Dict:
-        cls_id = int(detection['class_id'])
-        bbox = detection['bbox']
-        conf = float(detection['conf'])
-        bt_id = detection.get('tracker_id')
-        appearance = detection.get('appearance')
+    def _resolve_person_detection(self, box, frame: np.ndarray, appearance: Optional[np.ndarray]) -> Dict:
+        cls_id = int(box.cls[0])
+        bbox = self._bbox(box)
+        conf = float(box.conf[0])
+        bt_id = self._track_id(box)
         stable_id, match_meta = self.id_registry.resolve(bbox, cls_id, self.frame_count, bt_id, appearance=appearance)
         position_3d = self.distance_estimator.estimate_position_3d(bbox, is_person=True)
         self.id_registry.log_person_frame(stable_id, self.frame_count, frame, bbox, match_meta=match_meta, bt_id=bt_id)
@@ -799,16 +244,16 @@ class BagGuardSystem:
 
     def _resolve_bag_detection(
         self,
-        detection: Dict,
+        box,
         frame: np.ndarray,
         people: List[Dict],
+        appearance: Optional[np.ndarray],
     ) -> Dict:
-        cls_id = int(detection['class_id'])
-        bbox = detection['bbox']
-        conf = float(detection['conf'])
-        appearance = detection.get('appearance')
+        cls_id = int(box.cls[0])
+        bbox = self._bbox(box)
+        conf = float(box.conf[0])
         owner_hint = self._estimate_bag_owner_hint(bbox, people)
-        bt_id = detection.get('tracker_id')
+        bt_id = self._track_id(box)
         stable_id, match_meta = self.id_registry.resolve(
             bbox,
             cls_id,
@@ -848,7 +293,7 @@ class BagGuardSystem:
             owner = people_by_id.get(bag_state.owner_id) if bag_state and bag_state.owner_id else None
             if owner is None:
                 continue
-            distance = self.distance_estimator.calculate_ground_distance(bag['position_3d'], owner['position_3d'])
+            distance = self.distance_estimator.calculate_distance(bag['position_3d'], owner['position_3d'])
             self.visualizer.draw_distance_line(frame, bag['bbox'], owner['bbox'], distance)
 
     def _handle_persistence_checkpoint(self, stats: Dict, total_frames: int):
@@ -860,7 +305,7 @@ class BagGuardSystem:
         else:
             prefix = f"LIVE | Frame: {self.frame_count:5d}"
 
-        print(f"{prefix} | FPS: {stats['fps']:3d} | Raw: {stats['raw_detections']} | People: {stats['people_count']} | Bags: {stats['bags_count']} | Unattended: {stats['bags_unattended']}")
+        print(f"{prefix} | FPS: {stats['fps']:3d} | People: {stats['people_count']} | Bags: {stats['bags_count']} | Unattended: {stats['bags_unattended']}")
 
     def _process_current_frame(self, frame: np.ndarray, prev_time: float) -> Tuple[np.ndarray, Dict, float]:
         self.inference_frame_count += 1
@@ -955,33 +400,24 @@ class BagGuardSystem:
             return
 
         frame = cv2.resize(frame, (self.config.IMAGE_WIDTH, self.config.IMAGE_HEIGHT))
-        if self.detector_runtime == "openvino":
-            records = self._infer_openvino_records(frame, self.config.DETECTION_CONFIDENCE)
-            class_ids = [record['class_id'] for record in records]
-        else:
-            results = self.model.predict(
-                frame,
-                conf=self.config.DETECTION_CONFIDENCE,
-                iou=self.config.IOU_THRESHOLD,
-                classes=self.config.CLASS_IDS,
-                imgsz=self.imgsz,
-                device=self.detector_device,
-                half=self.half if self.detector_runtime == "torch" else False,
-                verbose=False,
-            )
+        results = self.model.predict(
+            frame,
+            conf=self.config.DETECTION_CONFIDENCE,
+            iou=self.config.IOU_THRESHOLD,
+            classes=self.config.CLASS_IDS,
+            imgsz=self.imgsz,
+            device=self.device,
+            half=self.half,
+            verbose=False,
+        )
 
-            boxes = results[0].boxes
-            if boxes is None or len(boxes) == 0:
-                print("⚠️  Startup inference: 0 detections for configured classes")
-                return
-            class_ids = boxes.cls.cpu().numpy().astype(int).tolist()
-
-        if not class_ids:
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
             print("⚠️  Startup inference: 0 detections for configured classes")
             return
 
         class_counts = {}
-        for cls_id in class_ids:
+        for cls_id in boxes.cls.cpu().numpy().astype(int).tolist():
             class_counts[cls_id] = class_counts.get(cls_id, 0) + 1
 
         person_count = class_counts.get(self.config.PERSON_CLASS_ID, 0)
@@ -994,33 +430,37 @@ class BagGuardSystem:
             print(f"  {label}: {class_counts.get(cid, 0)}")
         print(f"  Bags total: {bag_count}")
 
-    def extract_detections(self, detections: List[Dict], frame: np.ndarray) -> Tuple[List[Dict], List[Dict]]:
+    def extract_detections(self, results, frame: np.ndarray) -> Tuple[List[Dict], List[Dict]]:
         people = []
         bags = []
-        if not detections:
+        if results[0].boxes is None or len(results[0].boxes) == 0:
             return people, bags
 
-        for detection in detections:
-            cls_id = int(detection['class_id'])
+        boxes = results[0].boxes
+        person_appearances = self._collect_person_appearances(boxes, frame)
+        bag_appearances = self._collect_bag_appearances(boxes, frame)
+
+        for i in range(len(boxes)):
+            cls_id = int(boxes[i].cls[0])
             if cls_id != self.config.PERSON_CLASS_ID:
                 continue
 
-            conf = float(detection['conf'])
+            conf = float(boxes[i].conf[0])
             if not self._passes_conf_threshold(cls_id, conf):
                 continue
 
-            people.append(self._resolve_person_detection(detection, frame))
+            people.append(self._resolve_person_detection(boxes[i], frame, person_appearances.get(i)))
 
-        for detection in detections:
-            cls_id = int(detection['class_id'])
+        for i in range(len(boxes)):
+            cls_id = int(boxes[i].cls[0])
             if cls_id not in self.config.CLASS_IDS or cls_id == self.config.PERSON_CLASS_ID:
                 continue
 
-            conf = float(detection['conf'])
+            conf = float(boxes[i].conf[0])
             if not self._passes_conf_threshold(cls_id, conf):
                 continue
 
-            bags.append(self._resolve_bag_detection(detection, frame, people))
+            bags.append(self._resolve_bag_detection(boxes[i], frame, people, bag_appearances.get(i)))
 
         return people, bags
 
@@ -1048,30 +488,41 @@ class BagGuardSystem:
         if not people:
             return
 
-        people_by_id = {person['id']: person for person in people}
         for bag in bags:
-            owner_hint = bag.get('owner_hint')
-            if owner_hint is None:
-                continue
+            bx1, by1, bx2, by2 = bag['bbox']
+            bcx = (bx1 + bx2) / 2
+            bcy = (by1 + by2) / 2
+            best_depth = None
+            best_dist = 200.0
 
-            owner = people_by_id.get(owner_hint)
-            if owner is None:
-                continue
+            for person in people:
+                px1, py1, px2, py2 = person['bbox']
+                pcx = (px1 + px2) / 2
+                pcy = (py1 + py2) / 2
+                dist = float(np.hypot(bcx - pcx, bcy - pcy))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_depth = person['position_3d'][2]
 
-            image_distance = self.distance_estimator.calculate_image_distance(bag['bbox'], owner['bbox'])
-            if image_distance > self.config.BAG_DEPTH_REFINE_MAX_DISTANCE_PX:
-                continue
-
-            bag['position_3d'] = self.distance_estimator.estimate_position_3d(
-                bag['bbox'],
-                is_person=False,
-                reference_depth=owner['position_3d'][2],
-            )
+            if best_depth is not None:
+                bag['position_3d'] = self.distance_estimator.estimate_position_3d(bag['bbox'], is_person=False, reference_depth=best_depth)
 
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict]:
         current_time = time.time()
-        detections = self._detect_and_track(frame)
-        people, bags = self.extract_detections(detections, frame)
+        results = self.model.track(
+            frame,
+            persist=self.config.PERSIST,
+            conf=min(self.config.PERSON_CONF, self.config.BAG_CONF),
+            iou=self.config.IOU_THRESHOLD,
+            classes=self.config.CLASS_IDS,
+            tracker=self.tracker_path,
+            imgsz=self.imgsz,
+            device=self.device,
+            half=self.half,
+            verbose=False,
+        )
+
+        people, bags = self.extract_detections(results, frame)
         self._refine_bag_depths(bags, people)
 
         bag_states = self.ownership_manager.update_ownership(bags, people, current_time)
@@ -1083,15 +534,11 @@ class BagGuardSystem:
 
         stats = {
             'fps': 0,
-            'raw_detections': len(detections),
             'people_count': len(people),
             'bags_count': len(bags),
             'bags_ok': status_counts['OK'],
             'bags_potential': status_counts['POTENTIAL'],
             'bags_unattended': status_counts['UNATTENDED'],
-            'detector_runtime': self.detector_runtime,
-            'detector_device': self.detector_device,
-            'tracker_backend': self.tracker_backend,
             'frame_number': self.frame_count,
         }
         return frame, stats
@@ -1109,7 +556,7 @@ class BagGuardSystem:
         print(f"\n✓ Video: {total_frames} frames @ {fps} FPS")
 
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = AsyncVideoWriter(self.output_path, fourcc, fps, (self.config.IMAGE_WIDTH, self.config.IMAGE_HEIGHT))
+        out = cv2.VideoWriter(self.output_path, fourcc, fps, (self.config.IMAGE_WIDTH, self.config.IMAGE_HEIGHT))
         print("✓ Starting processing...\n")
 
         self.start_time = time.time()
@@ -1162,9 +609,8 @@ class BagGuardSystem:
             return False
         finally:
             self.id_registry.save_persistent_entries()
-            self.id_registry.close()
             cap.release()
-            out.close()
+            out.release()
             cv2.destroyAllWindows()
 
         elapsed = time.time() - self.start_time
