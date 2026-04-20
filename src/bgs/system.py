@@ -77,6 +77,19 @@ class BagGuardSystem:
             self.half = False
         self.model.to(self.device)
 
+        self.frame_count = 0
+        self.inference_frame_count = 0
+        self.person_ids_seen = set()
+        self.bag_ids_seen = set()
+        self.start_time = None
+        self.logged_person_frame_count = 0
+        self.logged_bag_frame_count = 0
+        self.runtime_frame_size: Optional[Tuple[int, int]] = None
+        self.last_people_frame = -10_000
+        self.last_bags_frame = -10_000
+        self.last_people_count = 0
+        self.last_bags_count = 0
+
         self._validate_class_config()
         self.tracker_path = self._resolve_tracker_path()
         self._log_device()
@@ -98,14 +111,6 @@ class BagGuardSystem:
         if self.bag_reid.enabled:
             print("✓ Bag re-ID initialized")
         self._log_loaded_registry_counts()
-
-        self.frame_count = 0
-        self.inference_frame_count = 0
-        self.person_ids_seen = set()
-        self.bag_ids_seen = set()
-        self.start_time = None
-        self.logged_person_frame_count = 0
-        self.logged_bag_frame_count = 0
 
     def _validate_class_config(self):
         expected_ids = self.config.EXPECTED_CLASS_IDS
@@ -190,6 +195,79 @@ class BagGuardSystem:
             'bags_unattended': 0,
             'frame_number': frame_number,
         }
+
+    def _set_runtime_frame_geometry(self, frame: np.ndarray):
+        frame_h, frame_w = frame.shape[:2]
+        if frame_w <= 0 or frame_h <= 0:
+            return
+
+        runtime_size = (int(frame_w), int(frame_h))
+        if self.runtime_frame_size == runtime_size:
+            return
+
+        self.runtime_frame_size = runtime_size
+        self.config.IMAGE_WIDTH = runtime_size[0]
+        self.config.IMAGE_HEIGHT = runtime_size[1]
+        self.config.FOCAL_LENGTH = (self.config.IMAGE_WIDTH / 2) / np.tan(np.radians(self.config.CAMERA_HFOV / 2))
+        print(f"✓ Frame geometry: {self.config.IMAGE_WIDTH}x{self.config.IMAGE_HEIGHT}")
+
+    def _passes_rescue_threshold(self, class_id: int, conf: float) -> bool:
+        if class_id == self.config.PERSON_CLASS_ID:
+            return conf >= self.config.DETECTION_RESCUE_PERSON_CONF
+        if class_id in self.config.BAG_CLASS_IDS:
+            return conf >= self.config.DETECTION_RESCUE_BAG_CONF
+        return False
+
+    def _recently_saw_people(self) -> bool:
+        return self.frame_count - self.last_people_frame <= self.config.DETECTION_RESCUE_RECENT_FRAMES
+
+    def _recently_saw_bags(self) -> bool:
+        return self.frame_count - self.last_bags_frame <= self.config.DETECTION_RESCUE_RECENT_FRAMES
+
+    def _rescue_missing_detections(self, frame: np.ndarray, people: List[Dict], bags: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        if not self.config.DETECTION_RESCUE_ENABLED:
+            return people, bags
+
+        rescue_people = self._recently_saw_people() and len(people) < self.last_people_count
+        rescue_bags = self._recently_saw_bags() and len(bags) < self.last_bags_count
+        if not rescue_people and not rescue_bags:
+            return people, bags
+
+        rescue_results = self.model.predict(
+            frame,
+            conf=min(self.config.DETECTION_RESCUE_PERSON_CONF, self.config.DETECTION_RESCUE_BAG_CONF),
+            iou=self.config.IOU_THRESHOLD,
+            classes=self.config.CLASS_IDS,
+            imgsz=self.imgsz,
+            device=self.device,
+            half=self.half,
+            verbose=False,
+        )
+
+        rescue_boxes = rescue_results[0].boxes
+        if rescue_boxes is None or len(rescue_boxes) == 0:
+            return people, bags
+
+        person_appearances = self._collect_person_appearances(rescue_boxes, frame) if rescue_people else {}
+        bag_appearances = self._collect_bag_appearances(rescue_boxes, frame) if rescue_bags else {}
+
+        if rescue_people:
+            for i in range(len(rescue_boxes)):
+                cls_id = int(rescue_boxes[i].cls[0])
+                conf = float(rescue_boxes[i].conf[0])
+                if cls_id != self.config.PERSON_CLASS_ID or not self._passes_rescue_threshold(cls_id, conf):
+                    continue
+                people.append(self._resolve_person_detection(rescue_boxes[i], frame, person_appearances.get(i)))
+
+        if rescue_bags:
+            for i in range(len(rescue_boxes)):
+                cls_id = int(rescue_boxes[i].cls[0])
+                conf = float(rescue_boxes[i].conf[0])
+                if cls_id not in self.config.BAG_CLASS_IDS or not self._passes_rescue_threshold(cls_id, conf):
+                    continue
+                bags.append(self._resolve_bag_detection(rescue_boxes[i], frame, people, bag_appearances.get(i)))
+
+        return people, bags
 
     def _collect_person_appearances(self, boxes, frame: np.ndarray) -> Dict[int, np.ndarray]:
         person_appearances: Dict[int, np.ndarray] = {}
@@ -399,7 +477,7 @@ class BagGuardSystem:
             print("⚠️  Startup inference skipped: no frame read")
             return
 
-        frame = cv2.resize(frame, (self.config.IMAGE_WIDTH, self.config.IMAGE_HEIGHT))
+        self._set_runtime_frame_geometry(frame)
         results = self.model.predict(
             frame,
             conf=self.config.DETECTION_CONFIDENCE,
@@ -523,6 +601,17 @@ class BagGuardSystem:
         )
 
         people, bags = self.extract_detections(results, frame)
+        people, bags = self._rescue_missing_detections(frame, people, bags)
+        if people:
+            self.last_people_frame = self.frame_count
+            self.last_people_count = len(people)
+        else:
+            self.last_people_count = 0
+        if bags:
+            self.last_bags_frame = self.frame_count
+            self.last_bags_count = len(bags)
+        else:
+            self.last_bags_count = 0
         self._refine_bag_depths(bags, people)
 
         bag_states = self.ownership_manager.update_ownership(bags, people, current_time)
@@ -556,8 +645,7 @@ class BagGuardSystem:
         print(f"\n✓ Video: {total_frames} frames @ {fps} FPS")
 
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(self.output_path, fourcc, fps, (self.config.IMAGE_WIDTH, self.config.IMAGE_HEIGHT))
-        print("✓ Starting processing...\n")
+        out = None
 
         self.start_time = time.time()
         prev_time = time.time()
@@ -574,7 +662,12 @@ class BagGuardSystem:
 
                 self.frame_count += 1
                 read_count += 1
-                frame = cv2.resize(frame, (self.config.IMAGE_WIDTH, self.config.IMAGE_HEIGHT))
+
+                if out is None:
+                    self._set_runtime_frame_geometry(frame)
+                    output_fps = fps if fps > 0 else 30
+                    out = cv2.VideoWriter(self.output_path, fourcc, output_fps, (self.config.IMAGE_WIDTH, self.config.IMAGE_HEIGHT))
+                    print("✓ Starting processing...\n")
 
                 do_infer = (self.skip == 0) or (read_count % (self.skip + 1) == 1)
                 if do_infer:
@@ -610,7 +703,8 @@ class BagGuardSystem:
         finally:
             self.id_registry.save_persistent_entries()
             cap.release()
-            out.release()
+            if out is not None:
+                out.release()
             cv2.destroyAllWindows()
 
         elapsed = time.time() - self.start_time

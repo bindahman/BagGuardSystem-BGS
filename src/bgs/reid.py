@@ -393,6 +393,19 @@ class BGSRegistry:
         if track_match is not None:
             return track_match
 
+        best_id, geometry_meta = self._match_by_geometry(
+            bbox,
+            class_id,
+            frame_number,
+            used_ids,
+            centroid_thresh,
+            max_age_frames=self.config.REID_GEOMETRY_PRIORITY_MAX_AGE_FRAMES,
+        )
+        if best_id is not None:
+            self._update(best_id, bbox, frame_number, bt_id, appearance, class_id)
+            used_ids.add(best_id)
+            return best_id, geometry_meta
+
         if class_id == self.config.PERSON_CLASS_ID and appearance is not None:
             person_match = self._resolve_person_appearance_match(
                 bbox,
@@ -520,11 +533,13 @@ class BGSRegistry:
         frame_number: int,
         used_ids: set,
         centroid_thresh: float,
+        max_age_frames: Optional[int] = None,
     ) -> Tuple[Optional[int], Optional[Dict[str, float | str]]]:
         best_id = None
         best_score = (-1.0, float('-inf'))
         best_meta = None
         cx, cy = self._centroid(bbox)
+        age_limit = self.config.REID_MATCH_MAX_AGE_FRAMES if max_age_frames is None else min(self.config.REID_MATCH_MAX_AGE_FRAMES, max_age_frames)
 
         for stable_id, entry in self.entries.items():
             if not self._class_match(entry['class_id'], class_id) or stable_id in used_ids:
@@ -533,7 +548,7 @@ class BGSRegistry:
                 continue
 
             age = frame_number - entry['last_frame']
-            if age < 0 or age > self.config.REID_MATCH_MAX_AGE_FRAMES:
+            if age < 0 or age > age_limit:
                 continue
 
             iou = self._iou(bbox, entry['bbox'])
