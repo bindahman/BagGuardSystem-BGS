@@ -16,6 +16,8 @@ def main():
     parser.add_argument("--max_fps", type=float, default=12, help="Max processing FPS (0 to disable)")
     parser.add_argument("--skip", type=int, default=0, help="Process every (skip+1)th frame")
     parser.add_argument("--half", action="store_true", help="Use FP16 if CUDA is available")
+    parser.add_argument("--detector-runtime", choices=["torch", "openvino"], default="torch", help="Detector runtime: torch (default) or openvino")
+    parser.add_argument("--openvino-device", choices=["auto", "cpu", "gpu"], default="auto", help="OpenVINO device: auto (default), cpu, or gpu")
     parser.add_argument("--tracker-backend", choices=["deepsort", "bytetrack"], default="deepsort", help="Tracking backend: deepsort (default) or bytetrack")
     parser.add_argument("--tracker-profile", choices=["main", "stable"], default="main", help="ByteTrack preset: main (default) or stable (longer persistence)")
     args = parser.parse_args()
@@ -63,6 +65,8 @@ def main():
         max_fps=args.max_fps,
         skip=args.skip,
         half=args.half,
+        detector_runtime=args.detector_runtime,
+        openvino_device=args.openvino_device,
         tracker_backend=args.tracker_backend,
         tracker_profile=args.tracker_profile,
         show=args.show,

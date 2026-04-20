@@ -3,12 +3,49 @@ import pickle
 import time
 from collections import deque
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from .config import BGSConfig
+
+
+class AsyncFrameLogger:
+    def __init__(self, max_queue_size: int = 512):
+        self._queue: Queue = Queue(maxsize=max_queue_size)
+        self._worker_thread = Thread(target=self._run, name="bgs-frame-logger", daemon=True)
+        self._worker_thread.start()
+
+    def submit(self, image_path: Path, crop: np.ndarray, metadata_path: Path, record: Dict):
+        self._queue.put((Path(image_path), crop.copy(), Path(metadata_path), record))
+
+    def flush(self):
+        self._queue.join()
+
+    def close(self):
+        self.flush()
+        self._queue.put(None)
+        self._worker_thread.join(timeout=5.0)
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+
+                image_path, crop, metadata_path, record = item
+                image_path.parent.mkdir(parents=True, exist_ok=True)
+                metadata_path.parent.mkdir(parents=True, exist_ok=True)
+                if not cv2.imwrite(str(image_path), crop):
+                    continue
+                with open(metadata_path, 'a', encoding='utf-8') as file_handle:
+                    file_handle.write(json.dumps(record) + "\n")
+            finally:
+                self._queue.task_done()
 
 
 class PersonReIDEmbedder:
@@ -199,6 +236,7 @@ class BGSRegistry:
         self.person_log_dir = Path(person_log_dir) if person_log_dir is not None else None
         self.bag_persist_path = Path(bag_persist_path) if bag_persist_path is not None else None
         self.bag_log_dir = Path(bag_log_dir) if bag_log_dir is not None else None
+        self.frame_logger = AsyncFrameLogger()
         self.loaded_person_count = 0
         self.loaded_bag_count = 0
         self.load_persistent_entries()
@@ -438,6 +476,19 @@ class BGSRegistry:
         if track_match is not None:
             return track_match
 
+        best_id, geometry_meta = self._match_by_geometry(
+            bbox,
+            class_id,
+            frame_number,
+            used_ids,
+            centroid_thresh,
+            max_age_frames=self.config.REID_GEOMETRY_PRIORITY_MAX_AGE_FRAMES,
+        )
+        if best_id is not None:
+            self._update(best_id, bbox, frame_number, bt_id, appearance, class_id)
+            used_ids.add(best_id)
+            return best_id, geometry_meta
+
         if class_id == self.config.PERSON_CLASS_ID and appearance is not None:
             person_match = self._resolve_person_appearance_match(
                 bbox,
@@ -559,11 +610,13 @@ class BGSRegistry:
         frame_number: int,
         used_ids: set,
         centroid_thresh: float,
+        max_age_frames: Optional[int] = None,
     ) -> Tuple[Optional[int], Optional[Dict[str, float | str]]]:
         best_id = None
         best_score = (-1.0, float('-inf'))
         best_meta = None
         cx, cy = self._centroid(bbox)
+        age_limit = self.config.REID_MATCH_MAX_AGE_FRAMES if max_age_frames is None else min(self.config.REID_MATCH_MAX_AGE_FRAMES, max_age_frames)
 
         for stable_id, entry in self.entries.items():
             if not self._class_match(entry['class_id'], class_id) or stable_id in used_ids:
@@ -572,7 +625,7 @@ class BGSRegistry:
                 continue
 
             age = frame_number - entry['last_frame']
-            if age < 0 or age > self.config.REID_MATCH_MAX_AGE_FRAMES:
+            if age < 0 or age > age_limit:
                 continue
 
             iou = self._iou(bbox, entry['bbox'])
@@ -774,8 +827,15 @@ class BGSRegistry:
         return loaded_count
 
     def save_persistent_entries(self):
+        self.flush_frame_logs()
         self._save_entries_to_path(self.person_persist_path, self.config.PERSON_CLASS_ID)
         self._save_entries_to_path(self.bag_persist_path, None)
+
+    def flush_frame_logs(self):
+        self.frame_logger.flush()
+
+    def close(self):
+        self.frame_logger.close()
 
     def _save_entries_to_path(self, persist_path: Optional[Path], expected_class_id: Optional[int]):
         if persist_path is None:
@@ -890,17 +950,12 @@ class BGSRegistry:
         prefix = self._entry_prefix(int(entry.get('class_id', self.config.PERSON_CLASS_ID)))
         entity_dir = log_dir / f"{prefix}_{stable_id}"
         frames_dir = entity_dir / self.config.REID_FRAME_IMAGE_DIRNAME
-        frames_dir.mkdir(parents=True, exist_ok=True)
 
         filename = f"frame_{frame_number:06d}{self.config.REID_FRAME_IMAGE_EXT}"
         image_path = frames_dir / filename
-        if not cv2.imwrite(str(image_path), crop):
-            return
-
         metadata_path = entity_dir / self.config.REID_FRAME_METADATA_NAME
         record = self._build_frame_record(entry, frame_number, image_path, clipped_bbox, match_meta, bt_id)
-        with open(metadata_path, 'a', encoding='utf-8') as file_handle:
-            file_handle.write(json.dumps(record) + "\n")
 
         entry['saved_frame_count'] = int(entry.get('saved_frame_count', 0)) + 1
         entry['last_logged_frame'] = frame_number
+        self.frame_logger.submit(image_path, crop, metadata_path, record)

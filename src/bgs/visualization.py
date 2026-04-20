@@ -93,7 +93,7 @@ class Visualizer:
         if not self.config.SHOW_DEBUG_OVERLAY:
             return
 
-        panel_h = 200
+        panel_h = 225
         panel_w = 550
 
         overlay = frame.copy()
@@ -127,8 +127,18 @@ class Visualizer:
         else:
             cv2.putText(frame, "All Bags Monitored", (15, y), self.config.FONT, 0.6, self.config.COLOR_TEXT, 2, cv2.LINE_AA)
 
+        runtime = str(stats.get('detector_runtime', 'torch')).upper()
+        device = str(stats.get('detector_device', '')).upper()
+        tracker_backend = str(stats.get('tracker_backend', 'deepsort'))
+
         y += spacing - 3
-        cv2.putText(frame, f"Tracker: {self.config.TRACKER.replace('.yaml', '')}", (15, y), self.config.FONT, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+        detector_label = f"Detector: {runtime}"
+        if device:
+            detector_label += f" ({device})"
+        cv2.putText(frame, detector_label, (15, y), self.config.FONT, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+
+        y += spacing - 5
+        cv2.putText(frame, f"Tracker: {tracker_backend} | Raw dets: {stats.get('raw_detections', 0)}", (15, y), self.config.FONT, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
 
         y += spacing - 5
         cv2.putText(frame, f"Frame: {stats.get('frame_number', 0)}", (15, y), self.config.FONT, 0.5, (180, 180, 180), 1, cv2.LINE_AA)

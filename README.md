@@ -81,8 +81,16 @@ python .\src\main.py --help
 - `--max_fps` processing FPS cap
 - `--skip` process every `skip + 1` frame
 - `--half` enable FP16 when CUDA is available
+- `--detector-runtime` choose `torch` or `openvino`
+- `--openvino-device` choose `auto`, `cpu`, or `gpu` when using OpenVINO
 - `--tracker-backend` choose `deepsort` or `bytetrack`
 - `--tracker-profile` choose `main` or `stable` when using ByteTrack
+
+OpenVINO example on Intel hardware:
+
+```bat
+python .\src\main.py --source 0 --show --detector-runtime openvino --openvino-device auto
+```
 
 ## Outputs
 

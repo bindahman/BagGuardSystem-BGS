@@ -47,14 +47,17 @@ class OwnershipManager:
             for person in people:
                 person_id = person['id']
                 person_pos = person['position_3d']
-                distance = self.distance_estimator.calculate_distance(bag_pos, person_pos)
-                person_distances.append((person_id, distance))
+                image_distance = self.distance_estimator.calculate_image_distance(bag['bbox'], person['bbox'])
+                if image_distance > self.config.OWNER_CANDIDATE_MAX_IMAGE_DISTANCE_PX:
+                    continue
+                distance = self.distance_estimator.calculate_ground_distance(bag_pos, person_pos)
+                person_distances.append((person_id, distance, image_distance))
 
-            person_distances.sort(key=lambda x: x[1])
+            person_distances.sort(key=lambda item: (item[1], item[2]))
 
             owner_distance = None
             if bag_state.owner_id is not None:
-                for pid, dist in person_distances:
+                for pid, dist, _ in person_distances:
                     if pid == bag_state.owner_id:
                         owner_distance = dist
                         break
@@ -85,7 +88,7 @@ class OwnershipManager:
         if not person_distances:
             return
 
-        closest_person_id, _ = person_distances[0]
+        closest_person_id, _, _ = person_distances[0]
 
         if bag_state.owner_id is None:
             if closest_distance <= self.config.ASSIGNMENT_DISTANCE:
