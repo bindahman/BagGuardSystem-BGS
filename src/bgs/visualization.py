@@ -29,7 +29,12 @@ class Visualizer:
         else:
             match_reason = detection.get('match_reason')
             match_score = detection.get('match_score')
-            if bag_state:
+            if detection.get('pending'):
+                color = self.config.COLOR_BAG_POTENTIAL
+                thickness = self.config.LINE_THICKNESS
+                frames_left = int(detection.get('pending_frames_left', 0))
+                label = f"{class_name.upper()} [ID in {frames_left}]"
+            elif bag_state:
                 if bag_state.status == "UNATTENDED":
                     color = self.config.COLOR_BAG_UNATTENDED
                     thickness = 5
@@ -128,7 +133,8 @@ class Visualizer:
             cv2.putText(frame, "All Bags Monitored", (15, y), self.config.FONT, 0.6, self.config.COLOR_TEXT, 2, cv2.LINE_AA)
 
         y += spacing - 3
-        cv2.putText(frame, f"Tracker: {self.config.TRACKER.replace('.yaml', '')}", (15, y), self.config.FONT, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+        tracker_backend = str(stats.get('tracker_backend') or self.config.TRACKER.replace('.yaml', ''))
+        cv2.putText(frame, f"Tracker: {tracker_backend}", (15, y), self.config.FONT, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
 
         y += spacing - 5
         cv2.putText(frame, f"Frame: {stats.get('frame_number', 0)}", (15, y), self.config.FONT, 0.5, (180, 180, 180), 1, cv2.LINE_AA)

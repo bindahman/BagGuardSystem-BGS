@@ -83,8 +83,23 @@ class PersonReIDEmbedder:
 
 
 class BagReIDEmbedder:
-    def __init__(self):
+    def __init__(self, device: str):
         self.config = BGSConfig
+        self.device = "cuda" if str(device).startswith("cuda") else "cpu"
+        self.extractor = None
+        self._fallback_notice_shown = False
+
+        try:
+            from deep_sort_realtime.embedder.embedder_pytorch import MobileNetv2_Embedder
+
+            self.extractor = MobileNetv2_Embedder(
+                half=self.device == "cuda",
+                bgr=True,
+                gpu=self.device == "cuda",
+            )
+            print("✓ Bag re-ID extractor loaded: DeepSORT MobileNetV2")
+        except Exception as e:
+            print(f"⚠️  Bag re-ID model unavailable, using fallback appearance features: {e}")
 
     @property
     def enabled(self) -> bool:
@@ -92,10 +107,15 @@ class BagReIDEmbedder:
 
     def crop_bag(self, frame: np.ndarray, bbox: List[float]) -> Optional[np.ndarray]:
         frame_h, frame_w = frame.shape[:2]
-        x1 = max(0, min(frame_w - 1, int(bbox[0])))
-        y1 = max(0, min(frame_h - 1, int(bbox[1])))
-        x2 = max(0, min(frame_w, int(bbox[2])))
-        y2 = max(0, min(frame_h, int(bbox[3])))
+        width = max(1.0, float(bbox[2] - bbox[0]))
+        height = max(1.0, float(bbox[3] - bbox[1]))
+        pad_x = int(width * 0.06)
+        pad_y = int(height * 0.06)
+
+        x1 = max(0, min(frame_w - 1, int(bbox[0]) - pad_x))
+        y1 = max(0, min(frame_h - 1, int(bbox[1]) - pad_y))
+        x2 = max(0, min(frame_w, int(bbox[2]) + pad_x))
+        y2 = max(0, min(frame_h, int(bbox[3]) + pad_y))
 
         if x2 <= x1 or y2 <= y1:
             return None
@@ -110,7 +130,32 @@ class BagReIDEmbedder:
 
         return crop
 
+    def extract(self, crops: List[np.ndarray]) -> List[Optional[np.ndarray]]:
+        if not crops:
+            return []
+
+        if self.extractor is not None:
+            try:
+                features = self.extractor.predict(crops)
+                embeddings = []
+                for feature in features:
+                    vector = np.asarray(feature, dtype=np.float32)
+                    norm = float(np.linalg.norm(vector))
+                    embeddings.append(vector / norm if norm > 0 else None)
+                return embeddings
+            except Exception as e:
+                if not self._fallback_notice_shown:
+                    print(f"⚠️  Bag re-ID model inference failed, using fallback appearance features: {e}")
+                    self._fallback_notice_shown = True
+
+        return [self._extract_fallback(crop) for crop in crops]
+
     def extract_one(self, crop: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if crop is None or crop.size == 0:
+            return None
+        return self.extract([crop])[0]
+
+    def _extract_fallback(self, crop: Optional[np.ndarray]) -> Optional[np.ndarray]:
         if crop is None or crop.size == 0:
             return None
 
@@ -156,6 +201,8 @@ class BGSRegistry:
         self.bag_log_dir = Path(bag_log_dir) if bag_log_dir is not None else None
         self.loaded_person_count = 0
         self.loaded_bag_count = 0
+        self.pending_bags: Dict[int, Dict] = {}
+        self.next_pending_bag_id = 1
         self.load_persistent_entries()
 
     def _persist_label(self, expected_class_id: Optional[int]) -> str:
@@ -188,18 +235,46 @@ class BGSRegistry:
             similarities.append(float(np.dot(appearance, stored_appearance)))
         return max(similarities) if similarities else -1.0
 
+    def _track_namespace_for_class(self, class_id: int) -> Optional[int]:
+        if class_id == self.config.PERSON_CLASS_ID:
+            return class_id + 1
+        if class_id in self.config.BAG_CLASS_IDS:
+            return class_id + 100
+        return None
+
+    def _track_id_matches_class(self, bt_id: int, class_id: int) -> bool:
+        track_value = int(bt_id)
+        if abs(track_value) < 1_000_000:
+            return True
+
+        namespace = abs(track_value) // 1_000_000
+        expected_namespace = self._track_namespace_for_class(class_id)
+        if expected_namespace is None:
+            return True
+        return namespace == expected_namespace
+
+    def _sanitize_bt_ids(self, bt_ids, class_id: int) -> set:
+        return {
+            int(bt_id)
+            for bt_id in (bt_ids or set())
+            if self._track_id_matches_class(int(bt_id), class_id)
+        }
+
     def _serialize_entry(self, stable_id: int, entry: Dict) -> Optional[Dict]:
         appearance = entry.get('appearance')
         gallery = entry.get('appearance_gallery') or []
         if appearance is None and not gallery:
             return None
 
+        class_id = int(entry.get('class_id', self.config.PERSON_CLASS_ID))
+        bt_ids = self._sanitize_bt_ids(entry.get('bt_ids', set()), class_id)
+
         return {
             'stable_id': stable_id,
-            'class_id': int(entry.get('class_id', self.config.PERSON_CLASS_ID)),
+            'class_id': class_id,
             'bbox': entry.get('bbox', [0.0, 0.0, 0.0, 0.0]),
             'last_seen_ts': float(entry.get('last_seen_ts', time.time())),
-            'bt_ids': sorted(entry.get('bt_ids', set())),
+            'bt_ids': sorted(bt_ids),
             'appearance': appearance.tolist() if appearance is not None else [],
             'appearance_gallery': [feature.tolist() for feature in gallery],
             'saved_frame_count': int(entry.get('saved_frame_count', 0)),
@@ -222,7 +297,7 @@ class BGSRegistry:
         for stable_id, entry in self.entries.items():
             if stable_id in used_ids:
                 continue
-            if self._class_match(entry['class_id'], class_id) and bt_id in entry['bt_ids']:
+            if self._track_class_match(entry['class_id'], class_id) and bt_id in entry['bt_ids']:
                 self._update(stable_id, bbox, frame_number, bt_id, appearance, class_id)
                 used_ids.add(stable_id)
                 return stable_id, {'reason': 'track', 'score': 1.0}
@@ -329,12 +404,227 @@ class BGSRegistry:
             'last_frame': frame_number,
             'last_seen_ts': time.time(),
             'bt_ids': {bt_id} if bt_id is not None else set(),
-            'appearance': appearance.copy() if appearance is not None else None,
-            'appearance_gallery': deque([appearance.copy()] if appearance is not None else [], maxlen=self._gallery_size(class_id)),
+            'appearance': None,
+            'appearance_gallery': deque(maxlen=self._gallery_size(class_id)),
             'owner_id': owner_hint if class_id in self.config.BAG_CLASS_IDS else None,
             'persisted_only': False,
         }
+        self._update_entry_appearance(self.entries[new_id], appearance, class_id)
         return new_id, {'reason': 'new', 'score': 0.0}
+
+    def _update_entry_appearance(self, entry: Dict, appearance: Optional[np.ndarray], class_id: int):
+        if appearance is None:
+            return
+
+        existing = entry.get('appearance')
+        gallery_size = self._gallery_size(class_id)
+        if existing is None or not self._same_feature_shape(appearance, existing):
+            entry['appearance'] = appearance.copy()
+            gallery = deque(
+                [
+                    feature for feature in (entry.get('appearance_gallery') or [])
+                    if self._same_feature_shape(appearance, feature)
+                ],
+                maxlen=gallery_size,
+            )
+            entry['appearance_gallery'] = gallery
+        else:
+            alpha = self.config.REID_APPEARANCE_UPDATE_WEIGHT
+            blended = ((1.0 - alpha) * existing) + (alpha * appearance)
+            norm = float(np.linalg.norm(blended))
+            entry['appearance'] = blended / norm if norm > 0 else appearance.copy()
+            gallery = deque(
+                [
+                    feature for feature in (entry.get('appearance_gallery') or [])
+                    if self._same_feature_shape(appearance, feature)
+                ],
+                maxlen=gallery_size,
+            )
+            entry['appearance_gallery'] = gallery
+
+        gallery = entry.setdefault('appearance_gallery', deque(maxlen=gallery_size))
+        gallery.append(appearance.copy())
+
+    def _new_pending_bag_id(self) -> int:
+        pending_id = -self.next_pending_bag_id
+        self.next_pending_bag_id += 1
+        return pending_id
+
+    def _create_pending_bag(
+        self,
+        bbox: List[float],
+        class_id: int,
+        frame_number: int,
+        bt_id: Optional[int],
+        appearance: Optional[np.ndarray],
+        owner_hint: Optional[int],
+    ) -> Tuple[int, Dict[str, float | str]]:
+        pending_id = self._new_pending_bag_id()
+        self.pending_bags[pending_id] = {
+            'bbox': bbox,
+            'class_id': class_id,
+            'first_frame': frame_number,
+            'last_frame': frame_number,
+            'last_seen_ts': time.time(),
+            'seen_frames': 1,
+            'bt_ids': {bt_id} if bt_id is not None else set(),
+            'appearance': None,
+            'appearance_gallery': deque(maxlen=self._gallery_size(class_id)),
+            'owner_id': owner_hint,
+        }
+        self._update_entry_appearance(self.pending_bags[pending_id], appearance, class_id)
+        frames_left = max(0, self.config.REID_BAG_PENDING_FRAMES - 1)
+        return pending_id, {'reason': 'pending', 'score': float(frames_left), 'frames_left': float(frames_left)}
+
+    def _match_pending_bag(
+        self,
+        bbox: List[float],
+        class_id: int,
+        frame_number: int,
+        bt_id: Optional[int],
+        used_ids: set,
+    ) -> Optional[int]:
+        best_id = None
+        best_score = (-1.0, float('-inf'))
+        cx, cy = self._centroid(bbox)
+
+        for pending_id, entry in self.pending_bags.items():
+            if pending_id in used_ids:
+                continue
+            if int(entry.get('class_id', -1)) != int(class_id):
+                continue
+
+            age = frame_number - int(entry.get('last_frame', frame_number))
+            if age < 0 or age > self.config.REID_BAG_PENDING_MAX_AGE_FRAMES:
+                continue
+
+            if bt_id is not None and bt_id in entry.get('bt_ids', set()):
+                return pending_id
+
+            iou = self._iou(bbox, entry['bbox'])
+            ex, ey = self._centroid(entry['bbox'])
+            centroid_dist = float(np.hypot(cx - ex, cy - ey))
+            if iou < self.config.REID_BAG_PENDING_IOU_THRESH and centroid_dist > self.config.REID_BAG_PENDING_CENTROID_THRESH:
+                continue
+
+            score = (iou, -centroid_dist)
+            if score > best_score:
+                best_score = score
+                best_id = pending_id
+
+        return best_id
+
+    def _update_pending_bag(
+        self,
+        pending_id: int,
+        bbox: List[float],
+        class_id: int,
+        frame_number: int,
+        bt_id: Optional[int],
+        appearance: Optional[np.ndarray],
+        owner_hint: Optional[int],
+    ) -> Dict:
+        entry = self.pending_bags[pending_id]
+        if frame_number != int(entry.get('last_frame', -1)):
+            entry['seen_frames'] = int(entry.get('seen_frames', 0)) + 1
+        entry['bbox'] = bbox
+        entry['class_id'] = class_id
+        entry['last_frame'] = frame_number
+        entry['last_seen_ts'] = time.time()
+        if bt_id is not None:
+            entry.setdefault('bt_ids', set()).add(bt_id)
+        if owner_hint is not None:
+            entry['owner_id'] = owner_hint
+        self._update_entry_appearance(entry, appearance, class_id)
+        return entry
+
+    def _confirm_pending_bag(
+        self,
+        pending_id: int,
+        frame_number: int,
+        used_ids: set,
+        centroid_thresh: float,
+    ) -> Tuple[int, Dict[str, float | str]]:
+        pending = self.pending_bags[pending_id]
+        bbox = pending['bbox']
+        class_id = int(pending['class_id'])
+        bt_ids = set(pending.get('bt_ids', set()))
+        bt_id = next(iter(bt_ids), None)
+        appearance = pending.get('appearance')
+        owner_hint = pending.get('owner_id')
+
+        if appearance is not None:
+            bag_match = self._resolve_bag_appearance_match(
+                bbox,
+                frame_number,
+                used_ids,
+                centroid_thresh,
+                bt_id,
+                appearance,
+                class_id,
+                owner_hint,
+            )
+            if bag_match is not None:
+                del self.pending_bags[pending_id]
+                return bag_match
+
+        best_id, geometry_meta = self._match_by_geometry(
+            bbox,
+            class_id,
+            frame_number,
+            used_ids,
+            centroid_thresh,
+            max_age_frames=self.config.REID_GEOMETRY_PRIORITY_MAX_AGE_FRAMES,
+        )
+        if best_id is not None:
+            self._update(best_id, bbox, frame_number, bt_id, appearance, class_id)
+            if owner_hint is not None:
+                self.entries[best_id]['owner_id'] = owner_hint
+            del self.pending_bags[pending_id]
+            return best_id, geometry_meta
+
+        best_id, geometry_meta = self._match_by_geometry(bbox, class_id, frame_number, used_ids, centroid_thresh)
+        if best_id is not None:
+            self._update(best_id, bbox, frame_number, bt_id, appearance, class_id)
+            if owner_hint is not None:
+                self.entries[best_id]['owner_id'] = owner_hint
+            del self.pending_bags[pending_id]
+            return best_id, geometry_meta
+
+        new_id, match_meta = self._create_entry(bbox, class_id, frame_number, bt_id, appearance, owner_hint)
+        new_entry = self.entries[new_id]
+        new_entry['bt_ids'].update(bt_ids)
+        gallery = new_entry.setdefault('appearance_gallery', deque(maxlen=self._gallery_size(class_id)))
+        gallery.clear()
+        for feature in pending.get('appearance_gallery') or []:
+            gallery.append(feature.copy())
+        if appearance is not None and not gallery:
+            gallery.append(appearance.copy())
+        del self.pending_bags[pending_id]
+        return new_id, match_meta
+
+    def _resolve_pending_bag(
+        self,
+        bbox: List[float],
+        class_id: int,
+        frame_number: int,
+        used_ids: set,
+        centroid_thresh: float,
+        bt_id: Optional[int],
+        appearance: Optional[np.ndarray],
+        owner_hint: Optional[int],
+    ) -> Tuple[int, Dict[str, float | str]]:
+        pending_id = self._match_pending_bag(bbox, class_id, frame_number, bt_id, used_ids)
+        if pending_id is None:
+            return self._create_pending_bag(bbox, class_id, frame_number, bt_id, appearance, owner_hint)
+
+        pending = self._update_pending_bag(pending_id, bbox, class_id, frame_number, bt_id, appearance, owner_hint)
+        seen_frames = int(pending.get('seen_frames', 1))
+        frames_left = max(0, self.config.REID_BAG_PENDING_FRAMES - seen_frames)
+        if seen_frames < self.config.REID_BAG_PENDING_FRAMES:
+            return pending_id, {'reason': 'pending', 'score': float(frames_left), 'frames_left': float(frames_left)}
+
+        return self._confirm_pending_bag(pending_id, frame_number, used_ids, centroid_thresh)
 
     def _frame_log_allowed(self, entry: Dict, expected_class_id: Optional[int]) -> bool:
         class_id = int(entry.get('class_id', self.config.PERSON_CLASS_ID))
@@ -393,19 +683,6 @@ class BGSRegistry:
         if track_match is not None:
             return track_match
 
-        best_id, geometry_meta = self._match_by_geometry(
-            bbox,
-            class_id,
-            frame_number,
-            used_ids,
-            centroid_thresh,
-            max_age_frames=self.config.REID_GEOMETRY_PRIORITY_MAX_AGE_FRAMES,
-        )
-        if best_id is not None:
-            self._update(best_id, bbox, frame_number, bt_id, appearance, class_id)
-            used_ids.add(best_id)
-            return best_id, geometry_meta
-
         if class_id == self.config.PERSON_CLASS_ID and appearance is not None:
             person_match = self._resolve_person_appearance_match(
                 bbox,
@@ -433,11 +710,38 @@ class BGSRegistry:
             if bag_match is not None:
                 return bag_match
 
+        best_id, geometry_meta = self._match_by_geometry(
+            bbox,
+            class_id,
+            frame_number,
+            used_ids,
+            centroid_thresh,
+            max_age_frames=self.config.REID_GEOMETRY_PRIORITY_MAX_AGE_FRAMES,
+        )
+        if best_id is not None:
+            self._update(best_id, bbox, frame_number, bt_id, appearance, class_id)
+            used_ids.add(best_id)
+            return best_id, geometry_meta
+
         best_id, geometry_meta = self._match_by_geometry(bbox, class_id, frame_number, used_ids, centroid_thresh)
         if best_id is not None:
             self._update(best_id, bbox, frame_number, bt_id, appearance, class_id)
             used_ids.add(best_id)
             return best_id, geometry_meta
+
+        if class_id in self.config.BAG_CLASS_IDS:
+            pending_id, match_meta = self._resolve_pending_bag(
+                bbox,
+                class_id,
+                frame_number,
+                used_ids,
+                centroid_thresh,
+                bt_id,
+                appearance,
+                owner_hint,
+            )
+            used_ids.add(pending_id)
+            return pending_id, match_meta
 
         new_id, match_meta = self._create_entry(bbox, class_id, frame_number, bt_id, appearance, owner_hint)
         used_ids.add(new_id)
@@ -459,36 +763,10 @@ class BGSRegistry:
         entry['persisted_only'] = False
         if class_id is not None and class_id in self.config.BAG_CLASS_IDS:
             entry['class_id'] = class_id
-        if bt_id is not None:
+        entry['bt_ids'] = self._sanitize_bt_ids(entry.get('bt_ids', set()), entry['class_id'])
+        if bt_id is not None and self._track_id_matches_class(bt_id, entry['class_id']):
             entry['bt_ids'].add(bt_id)
-        if appearance is not None:
-            existing = entry.get('appearance')
-            gallery_size = self._gallery_size(entry['class_id'])
-            if existing is None or not self._same_feature_shape(appearance, existing):
-                entry['appearance'] = appearance.copy()
-                gallery = deque(
-                    [
-                        feature for feature in (entry.get('appearance_gallery') or [])
-                        if self._same_feature_shape(appearance, feature)
-                    ],
-                    maxlen=gallery_size,
-                )
-                entry['appearance_gallery'] = gallery
-            else:
-                alpha = self.config.REID_APPEARANCE_UPDATE_WEIGHT
-                blended = ((1.0 - alpha) * existing) + (alpha * appearance)
-                norm = float(np.linalg.norm(blended))
-                entry['appearance'] = blended / norm if norm > 0 else appearance.copy()
-                gallery = deque(
-                    [
-                        feature for feature in (entry.get('appearance_gallery') or [])
-                        if self._same_feature_shape(appearance, feature)
-                    ],
-                    maxlen=gallery_size,
-                )
-                entry['appearance_gallery'] = gallery
-            gallery = entry.setdefault('appearance_gallery', deque(maxlen=gallery_size))
-            gallery.append(appearance.copy())
+        self._update_entry_appearance(entry, appearance, entry['class_id'])
 
     def _expire(self, frame_number: int):
         now = time.time()
@@ -497,6 +775,10 @@ class BGSRegistry:
             if (
                 value.get('persisted_only') and now - float(value.get('last_seen_ts', 0.0)) <= self.config.REID_PERSIST_MAX_AGE_SECONDS
             ) or value.get('class_id') == self.config.PERSON_CLASS_ID or frame_number - value['last_frame'] <= self.config.REID_MAX_AGE_FRAMES
+        }
+        self.pending_bags = {
+            key: value for key, value in self.pending_bags.items()
+            if frame_number - int(value.get('last_frame', frame_number)) <= self.config.REID_BAG_PENDING_MAX_AGE_FRAMES
         }
         self.used_ids_by_frame = {key: value for key, value in self.used_ids_by_frame.items() if key >= frame_number - 2}
 
@@ -526,6 +808,16 @@ class BGSRegistry:
             return entry_class_id in self.config.BAG_CLASS_IDS
         return entry_class_id == observed_class_id
 
+    def _track_class_match(self, entry_class_id: int, observed_class_id: int) -> bool:
+        if observed_class_id in self.config.BAG_CLASS_IDS:
+            return entry_class_id == observed_class_id
+        return self._class_match(entry_class_id, observed_class_id)
+
+    def _geometry_class_match(self, entry_class_id: int, observed_class_id: int) -> bool:
+        if observed_class_id in self.config.BAG_CLASS_IDS:
+            return entry_class_id == observed_class_id
+        return self._class_match(entry_class_id, observed_class_id)
+
     def _match_by_geometry(
         self,
         bbox: List[float],
@@ -542,7 +834,7 @@ class BGSRegistry:
         age_limit = self.config.REID_MATCH_MAX_AGE_FRAMES if max_age_frames is None else min(self.config.REID_MATCH_MAX_AGE_FRAMES, max_age_frames)
 
         for stable_id, entry in self.entries.items():
-            if not self._class_match(entry['class_id'], class_id) or stable_id in used_ids:
+            if not self._geometry_class_match(entry['class_id'], class_id) or stable_id in used_ids:
                 continue
             if entry.get('persisted_only'):
                 continue
@@ -733,7 +1025,7 @@ class BGSRegistry:
                     'class_id': class_id,
                     'last_frame': 0,
                     'last_seen_ts': float(item.get('last_seen_ts', 0.0)),
-                    'bt_ids': set(item.get('bt_ids', [])),
+                    'bt_ids': self._sanitize_bt_ids(item.get('bt_ids', []), class_id),
                     'appearance': appearance,
                     'appearance_gallery': deque(gallery_arrays, maxlen=self._gallery_size(class_id)),
                     'saved_frame_count': int(item.get('saved_frame_count', 0)),
