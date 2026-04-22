@@ -1,8 +1,8 @@
 # BGS stable ByteTrack preset for improved ID persistence
 tracker_type: bytetrack
-track_high_thresh: 0.20
-track_low_thresh: 0.10
-new_track_thresh: 0.20
-track_buffer: 900
-match_thresh: 0.80
+track_high_thresh: 0.18
+track_low_thresh: 0.08
+new_track_thresh: 0.24
+track_buffer: 1200
+match_thresh: 0.88
 fuse_score: true
