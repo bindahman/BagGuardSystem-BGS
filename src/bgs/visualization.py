@@ -98,8 +98,25 @@ class Visualizer:
         if not self.config.SHOW_DEBUG_OVERLAY:
             return
 
-        panel_h = 200
-        panel_w = 550
+        frame_h, frame_w = frame.shape[:2]
+        panel_w = max(220, min(550, int(frame_w * 0.55)))
+        panel_h = max(145, min(200, int(frame_h * 0.36)))
+        panel_w = min(panel_w, max(frame_w - 4, 1))
+        panel_h = min(panel_h, max(frame_h - 4, 1))
+        compact_layout = panel_w < 480 or panel_h < 185
+        scale = min(panel_w / 550.0, panel_h / 200.0)
+        scale = max(0.55, min(1.0, scale))
+
+        title_scale = max(0.5, 0.8 * scale)
+        body_scale = max(0.38, 0.6 * scale)
+        small_scale = max(0.34, 0.5 * scale)
+        title_thickness = 2 if scale >= 0.85 else 1
+        body_thickness = 2 if scale >= 0.9 else 1
+        padding_x = max(12, int(15 * scale))
+        title_y = max(24, int(30 * scale))
+        divider_gap = max(8, int(10 * scale))
+        spacing = max(16, int(25 * scale))
+        small_spacing = max(14, int(18 * scale))
 
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, 0), (panel_w, panel_h), (20, 20, 20), -1)
@@ -108,45 +125,73 @@ class Visualizer:
 
         cv2.rectangle(frame, (0, 0), (panel_w, panel_h), self.config.COLOR_HIGHLIGHT, 2)
 
-        y = 30
-        spacing = 25
-        cv2.putText(frame, "BAG GUARD SYSTEM", (15, y), self.config.FONT, 0.8, self.config.COLOR_HIGHLIGHT, 2, cv2.LINE_AA)
-        y += 10
-        cv2.line(frame, (15, y), (panel_w - 15, y), self.config.COLOR_HIGHLIGHT, 2)
-
-        y += spacing
-        cv2.putText(frame, f"FPS: {stats.get('fps', 0)}", (15, y), self.config.FONT, 0.6, self.config.COLOR_TEXT, 2, cv2.LINE_AA)
-
-        y += spacing - 3
-        cv2.putText(frame, f"People: {stats.get('people_count', 0)} | Bags: {stats.get('bags_count', 0)}", (15, y), self.config.FONT, 0.6, self.config.COLOR_PERSON, 2, cv2.LINE_AA)
-
-        y += spacing - 3
         ok_count = stats.get('bags_ok', 0)
         pot_count = stats.get('bags_potential', 0)
         un_count = stats.get('bags_unattended', 0)
-        cv2.putText(frame, f"Status: OK:{ok_count} POT:{pot_count} UN:{un_count}", (15, y), self.config.FONT, 0.6, self.config.COLOR_BAG_OK, 2, cv2.LINE_AA)
+        tracker_backend = str(stats.get('tracker_backend') or self.config.TRACKER.replace('.yaml', ''))
+
+        cv2.putText(frame, "BAG GUARD SYSTEM", (padding_x, title_y), self.config.FONT, title_scale, self.config.COLOR_HIGHLIGHT, title_thickness, cv2.LINE_AA)
+        divider_y = title_y + divider_gap
+        cv2.line(frame, (padding_x, divider_y), (panel_w - padding_x, divider_y), self.config.COLOR_HIGHLIGHT, max(1, title_thickness), cv2.LINE_AA)
+
+        if compact_layout:
+            y = divider_y + spacing
+            compact_lines = [
+                (f"FPS: {stats.get('fps', 0)}", body_scale, self.config.COLOR_TEXT, body_thickness),
+                (f"People: {stats.get('people_count', 0)} | Bags: {stats.get('bags_count', 0)}", body_scale, self.config.COLOR_PERSON, body_thickness),
+                (f"Status: OK:{ok_count} POT:{pot_count} UN:{un_count}", body_scale, self.config.COLOR_BAG_OK, body_thickness),
+            ]
+
+            for text, font_scale, color, thickness in compact_lines:
+                cv2.putText(frame, text, (padding_x, y), self.config.FONT, font_scale, color, thickness, cv2.LINE_AA)
+                y += spacing
+
+            if un_count > 0:
+                alert_text = f"ALERT: UNATTENDED BAGS: {un_count}"
+                alert_color = self.config.COLOR_BAG_UNATTENDED
+            else:
+                alert_text = "All Bags Monitored"
+                alert_color = self.config.COLOR_TEXT
+            cv2.putText(frame, alert_text, (padding_x, y), self.config.FONT, body_scale, alert_color, body_thickness, cv2.LINE_AA)
+            y += spacing
+
+            cv2.putText(frame, f"Tracker: {tracker_backend} | Frame: {stats.get('frame_number', 0)}", (padding_x, y), self.config.FONT, small_scale, (180, 180, 180), 1, cv2.LINE_AA)
+            y += small_spacing
+            cv2.putText(frame, f"Dist:{self.config.ASSIGNMENT_DISTANCE}m Pot:{self.config.POTENTIAL_THRESHOLD}s", (padding_x, y), self.config.FONT, small_scale, (200, 200, 200), 1, cv2.LINE_AA)
+            y += small_spacing
+            cv2.putText(frame, f"Unatt:{self.config.UNATTENDED_THRESHOLD}s Lock:{self.config.OWNERSHIP_LOCK_TIME}s", (padding_x, y), self.config.FONT, small_scale, (200, 200, 200), 1, cv2.LINE_AA)
+            return
+
+        y = divider_y + spacing
+        cv2.putText(frame, f"FPS: {stats.get('fps', 0)}", (padding_x, y), self.config.FONT, body_scale, self.config.COLOR_TEXT, body_thickness, cv2.LINE_AA)
+
+        y += spacing - 3
+        cv2.putText(frame, f"People: {stats.get('people_count', 0)} | Bags: {stats.get('bags_count', 0)}", (padding_x, y), self.config.FONT, body_scale, self.config.COLOR_PERSON, body_thickness, cv2.LINE_AA)
+
+        y += spacing - 3
+        cv2.putText(frame, f"Status: OK:{ok_count} POT:{pot_count} UN:{un_count}", (padding_x, y), self.config.FONT, body_scale, self.config.COLOR_BAG_OK, body_thickness, cv2.LINE_AA)
 
         y += spacing - 3
         if un_count > 0:
-            cv2.putText(frame, f"ALERT: UNATTENDED BAGS: {un_count}", (15, y), self.config.FONT, 0.65, self.config.COLOR_BAG_UNATTENDED, 3, cv2.LINE_AA)
+            cv2.putText(frame, f"ALERT: UNATTENDED BAGS: {un_count}", (padding_x, y), self.config.FONT, max(body_scale, 0.48), self.config.COLOR_BAG_UNATTENDED, max(body_thickness + 1, 2), cv2.LINE_AA)
         else:
-            cv2.putText(frame, "All Bags Monitored", (15, y), self.config.FONT, 0.6, self.config.COLOR_TEXT, 2, cv2.LINE_AA)
+            cv2.putText(frame, "All Bags Monitored", (padding_x, y), self.config.FONT, body_scale, self.config.COLOR_TEXT, body_thickness, cv2.LINE_AA)
 
         y += spacing - 3
-        tracker_backend = str(stats.get('tracker_backend') or self.config.TRACKER.replace('.yaml', ''))
-        cv2.putText(frame, f"Tracker: {tracker_backend}", (15, y), self.config.FONT, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Tracker: {tracker_backend}", (padding_x, y), self.config.FONT, small_scale, (180, 180, 180), 1, cv2.LINE_AA)
 
         y += spacing - 5
-        cv2.putText(frame, f"Frame: {stats.get('frame_number', 0)}", (15, y), self.config.FONT, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Frame: {stats.get('frame_number', 0)}", (padding_x, y), self.config.FONT, small_scale, (180, 180, 180), 1, cv2.LINE_AA)
 
-        y2 = 30 + spacing + 10
-        x2 = 280
-        cv2.putText(frame, "PARAMETERS:", (x2, y2), self.config.FONT, 0.5, self.config.COLOR_HIGHLIGHT, 1, cv2.LINE_AA)
-        y2 += 18
-        cv2.putText(frame, f"Assign Dist: {self.config.ASSIGNMENT_DISTANCE}m", (x2, y2), self.config.FONT, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-        y2 += 16
-        cv2.putText(frame, f"Potential: {self.config.POTENTIAL_THRESHOLD}s", (x2, y2), self.config.FONT, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-        y2 += 16
-        cv2.putText(frame, f"Unattended: {self.config.UNATTENDED_THRESHOLD}s", (x2, y2), self.config.FONT, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-        y2 += 16
-        cv2.putText(frame, f"Lock Time: {self.config.OWNERSHIP_LOCK_TIME}s", (x2, y2), self.config.FONT, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+        y2 = divider_y + spacing
+        x2 = max(int(panel_w * 0.52), padding_x + 190)
+        x2 = min(x2, panel_w - 150)
+        cv2.putText(frame, "PARAMETERS:", (x2, y2), self.config.FONT, small_scale, self.config.COLOR_HIGHLIGHT, 1, cv2.LINE_AA)
+        y2 += small_spacing
+        cv2.putText(frame, f"Assign Dist: {self.config.ASSIGNMENT_DISTANCE}m", (x2, y2), self.config.FONT, small_scale, (200, 200, 200), 1, cv2.LINE_AA)
+        y2 += small_spacing
+        cv2.putText(frame, f"Potential: {self.config.POTENTIAL_THRESHOLD}s", (x2, y2), self.config.FONT, small_scale, (200, 200, 200), 1, cv2.LINE_AA)
+        y2 += small_spacing
+        cv2.putText(frame, f"Unattended: {self.config.UNATTENDED_THRESHOLD}s", (x2, y2), self.config.FONT, small_scale, (200, 200, 200), 1, cv2.LINE_AA)
+        y2 += small_spacing
+        cv2.putText(frame, f"Lock Time: {self.config.OWNERSHIP_LOCK_TIME}s", (x2, y2), self.config.FONT, small_scale, (200, 200, 200), 1, cv2.LINE_AA)

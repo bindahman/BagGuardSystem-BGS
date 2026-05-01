@@ -20,7 +20,7 @@ class BGSConfig:
     IOU_THRESHOLD = 0.45
 
     TRACKER = "bytetrack.yaml"
-    TRACKER_BACKEND = "deepsort"
+    TRACKER_BACKEND = "bytetrack"
     PERSIST = True
     TRACK_BUFFER = 90
     TRACK_THRESH = 0.25

@@ -16,8 +16,10 @@ def main():
     parser.add_argument("--max_fps", type=float, default=12, help="Max processing FPS (0 to disable)")
     parser.add_argument("--skip", type=int, default=0, help="Process every (skip+1)th frame")
     parser.add_argument("--half", action="store_true", help="Use FP16 if CUDA is available")
-    parser.add_argument("--tracker-backend", choices=["deepsort", "bytetrack"], default="deepsort", help="Tracking backend: deepsort (default) or bytetrack")
-    parser.add_argument("--tracker-profile", choices=["main", "stable"], default="main", help="ByteTrack preset: main (default) or stable (longer persistence)")
+    parser.add_argument("--display-width", type=int, default=1280, help="Preview window target width in pixels (0 keeps raw width)")
+    parser.add_argument("--display-height", type=int, default=720, help="Preview window target height in pixels (0 keeps raw height)")
+    parser.add_argument("--tracker-backend", choices=["deepsort", "bytetrack"], default="bytetrack", help="Tracking backend: bytetrack (default) or deepsort")
+    parser.add_argument("--tracker-profile", choices=["main", "stable"], default="stable", help="ByteTrack preset: stable (default) or main")
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -66,6 +68,8 @@ def main():
         tracker_backend=args.tracker_backend,
         tracker_profile=args.tracker_profile,
         show=args.show,
+        display_width=args.display_width,
+        display_height=args.display_height,
     )
     success = system.run()
 

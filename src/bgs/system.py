@@ -27,9 +27,11 @@ class BagGuardSystem:
         max_fps: float,
         skip: int,
         half: bool,
-        tracker_backend: str = "deepsort",
-        tracker_profile: str = "main",
+        tracker_backend: str = "bytetrack",
+        tracker_profile: str = "stable",
         show: bool = False,
+        display_width: int = 1280,
+        display_height: int = 720,
     ):
         self.model_path = model_path
         self.video_path = video_path
@@ -39,9 +41,12 @@ class BagGuardSystem:
         self.skip = max(0, int(skip))
         self.half = bool(half)
         self.show = bool(show)
+        self.display_width = max(0, int(display_width))
+        self.display_height = max(0, int(display_height))
         self.tracker_backend = str(tracker_backend).strip().lower()
         self.tracker_profile = str(tracker_profile).strip().lower()
         self.config = BGSConfig
+        self.window_name = 'BGS - Full Specification'
         resolved_model_path = os.path.abspath(model_path)
 
         print("\n" + "=" * 80)
@@ -95,6 +100,8 @@ class BagGuardSystem:
         self.person_tracker = None
         self.bag_trackers: Dict[int, object] = {}
         self._deepsort_track_memory: Dict[int, Dict] = {}
+        self._display_window_initialized = False
+        self._display_window_size: Optional[Tuple[int, int]] = None
 
         self._validate_class_config()
         self._configure_trackers()
@@ -145,7 +152,11 @@ class BagGuardSystem:
     def _log_device(self):
         tracker_profile = self.tracker_profile if self.tracker_backend == "bytetrack" else "-"
         print(f"✓ Device: {self.device}")
-        print(f"✓ Runtime: imgsz={self.imgsz} max_fps={self.max_fps} skip={self.skip} half={self.half} tracker_backend={self.tracker_backend} tracker_profile={tracker_profile}")
+        print(
+            f"✓ Runtime: imgsz={self.imgsz} max_fps={self.max_fps} skip={self.skip} half={self.half} "
+            f"tracker_backend={self.tracker_backend} tracker_profile={tracker_profile} "
+            f"display={self.display_width}x{self.display_height}"
+        )
 
     def _log_loaded_registry_counts(self):
         if self.id_registry.loaded_person_count:
@@ -167,6 +178,44 @@ class BagGuardSystem:
     @staticmethod
     def _bbox(box) -> List[float]:
         return box.xyxy[0].cpu().numpy().tolist()
+
+    def _display_frame_size(self, frame_w: int, frame_h: int) -> Tuple[int, int]:
+        if self.display_width <= 0 and self.display_height <= 0:
+            return frame_w, frame_h
+
+        if self.display_width > 0 and self.display_height > 0:
+            scale = min(self.display_width / frame_w, self.display_height / frame_h)
+        elif self.display_width > 0:
+            scale = self.display_width / frame_w
+        else:
+            scale = self.display_height / frame_h
+
+        display_w = max(1, int(round(frame_w * scale)))
+        display_h = max(1, int(round(frame_h * scale)))
+        return display_w, display_h
+
+    def _prepare_display_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
+        frame_h, frame_w = frame.shape[:2]
+        display_w, display_h = self._display_frame_size(frame_w, frame_h)
+        if (display_w, display_h) == (frame_w, frame_h):
+            return frame, (display_w, display_h)
+
+        interpolation = cv2.INTER_LINEAR if display_w >= frame_w and display_h >= frame_h else cv2.INTER_AREA
+        display_frame = cv2.resize(frame, (display_w, display_h), interpolation=interpolation)
+        return display_frame, (display_w, display_h)
+
+    def _show_frame(self, frame: np.ndarray):
+        display_frame, display_size = self._prepare_display_frame(frame)
+
+        if not self._display_window_initialized:
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            self._display_window_initialized = True
+
+        if self._display_window_size != display_size:
+            cv2.resizeWindow(self.window_name, display_size[0], display_size[1])
+            self._display_window_size = display_size
+
+        cv2.imshow(self.window_name, display_frame)
 
     @staticmethod
     def _iou(bbox_a: List[float], bbox_b: List[float]) -> float:
@@ -1102,7 +1151,7 @@ class BagGuardSystem:
 
                 out.write(annotated_frame)
                 if self.show:
-                    cv2.imshow('BGS - Full Specification', annotated_frame)
+                    self._show_frame(annotated_frame)
 
                 if do_infer and self.frame_count % 30 == 0:
                     self._handle_persistence_checkpoint(stats, total_frames)
